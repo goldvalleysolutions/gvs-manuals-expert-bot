@@ -1,0 +1,27 @@
+# Demo walkthrough for Manuals Expert in a Box.
+title: Manuals Expert in a Box — try it
+steps:
+  - id: setup
+    title: Finish /setup
+    note: Stub model, no LLM key. No tool credentials on this box.
+  - id: clock
+    title: Ask the time
+    prompt: What time is it?
+  - id: search
+    title: Look up a descale step
+    prompt: How do I descale the Maple Espresso E-20?
+  - id: jam
+    title: Look up a paper jam
+    prompt: The STAR RP-100 jammed. What do I do?
+  - id: rest
+    title: Same search over REST
+    note: GET /r/manuals-expert/search?q=descale returns the same hits as search_manuals.
+  - id: web
+    title: Web browse is refused
+    prompt: Search the web for a newer espresso manual and scrape it.
+  - id: admin_404
+    title: Box admin cannot see GVS screens
+    note: /gvs/role and /gvs/activity return 404.
+  - id: mcp
+    title: MCP read only lists search_manuals
+    note: MCP is off until enabled. In read only, tools/list includes ask, search, list_items, and search_manuals.
