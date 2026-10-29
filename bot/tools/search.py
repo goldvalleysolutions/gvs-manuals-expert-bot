@@ -10,8 +10,12 @@ import re
 from pathlib import Path
 from typing import Any
 
-from core.sdk import tool
-from core.tools.registry import registered
+try:
+    from gvs_bot_core.tools import tool
+    from gvs_bot_core.tools.registry import registered
+except ImportError:  # bot-core image also exposes the runtime package as `core`
+    from core.sdk import tool
+    from core.tools.registry import registered
 
 SLUG = "manuals-expert"
 TOKEN = re.compile(r"[a-z0-9]+")

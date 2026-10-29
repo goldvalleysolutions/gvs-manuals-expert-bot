@@ -10,13 +10,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.cookiejar import CookieJar
+from typing import Any
 
-import httpx2
-
-from tests.mcp_helpers import call_tool, enable_mcp_http, list_tools
-
-BRAND = "Manuals Expert in a Box"
+BRAND = "Manuals Expert Bot"
 QUERY = "descale espresso"
+TOKEN_RE = re.compile(
+    r"(?:token|secret)['\"]?\s*[:=]\s*['\"]([A-Za-z0-9._\-]{12,})['\"]",
+    re.I,
+)
+CODE_RE = re.compile(r"<code[^>]*>\s*([A-Za-z0-9._\-]{12,})\s*</code>", re.I)
 
 
 def _opener() -> urllib.request.OpenerDirector:
@@ -81,6 +83,101 @@ def ask(opener: urllib.request.OpenerDirector, base: str, text: str) -> dict:
     return json.loads(raw)
 
 
+def _token_from(body: str) -> str | None:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        for key in ("token", "mcp_token", "secret"):
+            value = payload.get(key)
+            if isinstance(value, str) and len(value) >= 12:
+                return value
+    match = TOKEN_RE.search(body) or CODE_RE.search(body)
+    return match.group(1) if match else None
+
+
+def enable_mcp(opener: urllib.request.OpenerDirector, base: str, name: str = "manuals") -> str:
+    for path in ("/admin/mcp", "/admin"):
+        code, html = request(opener, base, "GET", path)
+        if code != 200:
+            continue
+        for fields in (
+            {"step": "mcp", "mode": "read_only", "name": name},
+            {"mode": "read_only", "name": name},
+            {"mcp_mode": "read_only", "token_name": name},
+        ):
+            try:
+                code, body = post_form(opener, base, path, fields, html)
+            except SystemExit:
+                continue
+            token = _token_from(body)
+            if token:
+                return token
+            if code in {200, 303}:
+                _, follow = request(opener, base, "GET", path)
+                token = _token_from(follow)
+                if token:
+                    return token
+    raise SystemExit("could not enable MCP / extract token")
+
+
+def _mcp_rpc(url: str, token: str, method: str, params: dict[str, Any] | None = None) -> Any:
+    payload = json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
+    ).encode()
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(f"MCP {method} {exc.code}: {exc.read().decode()[:300]}") from exc
+    if raw.startswith("event:") or raw.startswith("data:"):
+        lines = [line[5:].strip() for line in raw.splitlines() if line.startswith("data:")]
+        raw = lines[-1] if lines else raw
+    body = json.loads(raw)
+    if body.get("error"):
+        raise SystemExit(f"MCP {method} error: {body['error']}")
+    return body.get("result")
+
+
+def list_tools(url: str, token: str) -> list[str]:
+    result = _mcp_rpc(url, token, "tools/list")
+    tools = result.get("tools", result) if isinstance(result, dict) else result
+    names: list[str] = []
+    for item in tools or []:
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict) and item.get("name"):
+            names.append(str(item["name"]))
+    return names
+
+
+def call_tool(url: str, token: str, name: str, arguments: dict[str, Any]) -> str:
+    result = _mcp_rpc(url, token, "tools/call", {"name": name, "arguments": arguments})
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        if "result" in result and isinstance(result["result"], str):
+            return result["result"]
+        content = result.get("content")
+        if isinstance(content, list) and content:
+            first = content[0]
+            if isinstance(first, dict) and "text" in first:
+                return str(first["text"])
+        return json.dumps(result)
+    return json.dumps(result)
+
+
 def main() -> None:
     base, _repo, cname = sys.argv[1:4]
     opener = _opener()
@@ -94,7 +191,7 @@ def main() -> None:
         base,
         "/setup",
         {
-            "step": "box_admin",
+            "step": "bot_admin",
             "username": "admin",
             "password": "secret12",
             "email": "admin@example.com",
@@ -150,7 +247,7 @@ def main() -> None:
     print("step 5 web blocked")
     assert ask(opener, base, "CALL web.browse {}")["blocked"] is True
 
-    print("step 6 box admin 404")
+    print("step 6 bot admin 404")
     admin = _opener()
     code, login_html = request(admin, base, "GET", "/admin/login")
     assert code == 200
@@ -170,8 +267,7 @@ def main() -> None:
     print("step 7 mcp")
     code, mcp_off = request(opener, base, "GET", "/mcp")
     assert code == 404, (code, mcp_off[:200])
-    http = httpx2.Client(base_url=base, follow_redirects=True, timeout=30.0)
-    token = enable_mcp_http(http, mode="read_only", name="manuals")
+    token = enable_mcp(admin, base, name="manuals")
     names = list_tools(f"{base}/mcp", token)
     assert "ask" in names and "search_manuals" in names, names
     assert "email.send" not in names, names
@@ -182,7 +278,6 @@ def main() -> None:
     assert mcp_body["result"] == rest["text"], (mcp_body["result"], rest["text"])
     asked = call_tool(f"{base}/mcp", token, "ask", {"text": "ping"})
     assert "(stub)" in asked or "ping" in asked, asked
-    http.close()
     print("OK manuals-expert-steps")
 
 

@@ -1,9 +1,9 @@
-# Demo walkthrough for Manuals Expert in a Box.
-title: Manuals Expert in a Box — try it
+# Demo walkthrough for Manuals Expert Bot.
+title: Manuals Expert Bot — try it
 steps:
   - id: setup
     title: Finish /setup
-    note: Stub model, no LLM key. No tool credentials on this box.
+    note: Stub model, no LLM key. No tool credentials on this bot.
   - id: clock
     title: Ask the time
     prompt: What time is it?
@@ -20,7 +20,7 @@ steps:
     title: Web browse is refused
     prompt: Search the web for a newer espresso manual and scrape it.
   - id: admin_404
-    title: Box admin cannot see GVS screens
+    title: Bot admin cannot see GVS screens
     note: /gvs/role and /gvs/activity return 404.
   - id: mcp
     title: MCP read only lists search_manuals

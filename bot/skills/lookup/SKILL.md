@@ -1,6 +1,6 @@
 ---
 name: lookup
-description: Search the on-box manuals and answer from the matching pages only.
+description: Search the manuals on this bot and answer from the matching pages only.
 ---
 
 # Look up equipment manuals

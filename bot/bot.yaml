@@ -1,0 +1,22 @@
+# Manuals Expert Bot. Image: ghcr.io/goldvalleysolutions/manuals-expert-bot
+# Validate: make lint-bot
+# Role tool: search_manuals (bot/tools/search.py) + REST
+# GET /r/manuals-expert/search. Web browsing is not allowed.
+name: Manuals Expert Bot
+slug: manuals-expert
+version: 0.2.0
+core: "0.2"
+role: role.md
+skills: skills/
+tools_allowed:
+  - clock.now
+  - search_manuals
+tools: tools/
+services: services/
+connectors: {}
+wizard: []
+theme: theme.yaml
+demo: demo/scenario.yaml
+memory: { history_turns: 20, facts: true, retention_days: 30 }
+mcp: { expose: [ask, search, list_items, search_manuals] }
+cost: { runs: "10 chats/day", turns_per_chat: 4 }

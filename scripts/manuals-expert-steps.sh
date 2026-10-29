@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Manuals Expert walkthrough against a built manuals-expert-in-a-box image.
+# Manuals Expert walkthrough against a built manuals-expert-bot image.
 # Stub LLM, MCP, tool + REST parity. Usage: scripts/manuals-expert-steps.sh <image> [host-port]
 set -euo pipefail
 
@@ -31,5 +31,4 @@ until curl -fsS "${base}/health" >/dev/null; do
   sleep 1
 done
 
-export PYTHONPATH="$here"
 python3 "$here/scripts/manuals_expert_steps_http.py" "$base" "$here" "$name"

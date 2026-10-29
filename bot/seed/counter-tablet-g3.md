@@ -13,4 +13,4 @@ Do not pull the USB cable while a ticket is open — that drops the last order.
 
 ## Firmware
 Shop builds ship on firmware 3.2. Only apply an update the owner downloaded; this
-box does not fetch updates from the web.
+bot does not fetch updates from the web.
