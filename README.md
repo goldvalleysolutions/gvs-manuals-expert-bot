@@ -108,7 +108,7 @@ the stub model that is **$0**.
 |---|---|---|
 | Manifest | `bot/bot.yaml` | `make lint-bot` |
 | Role / skills | `bot/role.md`, `bot/skills/lookup/SKILL.md` | Seeded into `bot.db` on first boot |
-| Tools | `bot/tools/search.py` | `search_manuals` (read; chat + MCP) via `gvs_bot_core.tools` |
+| Tools | `bot/tools/search.py` | `search_manuals` (read; chat + MCP) via `core.sdk` |
 | REST | `bot/services/search.py` | `GET /r/manuals-expert/search` |
 | Manuals | `/data/manuals-expert/` | Role-owned store; core never writes here |
 | Theme | `bot/theme.yaml` | GVS gold/white/Inter defaults |

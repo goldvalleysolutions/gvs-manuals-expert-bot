@@ -14,11 +14,21 @@ from typing import Any
 
 BRAND = "Manuals Expert Bot"
 QUERY = "descale espresso"
+MCP_ACCEPT = "application/json, text/event-stream"
 TOKEN_RE = re.compile(
     r"(?:token|secret)['\"]?\s*[:=]\s*['\"]([A-Za-z0-9._\-]{12,})['\"]",
     re.I,
 )
 CODE_RE = re.compile(r"<code[^>]*>\s*([A-Za-z0-9._\-]{12,})\s*</code>", re.I)
+
+
+def mcp_url(base: str) -> str:
+    return base.rstrip("/") + "/mcp/"
+
+
+def origin_of(base: str) -> str:
+    parsed = urllib.parse.urlparse(base)
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _opener() -> urllib.request.OpenerDirector:
@@ -98,31 +108,27 @@ def _token_from(body: str) -> str | None:
 
 
 def enable_mcp(opener: urllib.request.OpenerDirector, base: str, name: str = "manuals") -> str:
-    for path in ("/admin/mcp", "/admin"):
-        code, html = request(opener, base, "GET", path)
-        if code != 200:
-            continue
-        for fields in (
-            {"step": "mcp", "mode": "read_only", "name": name},
-            {"mode": "read_only", "name": name},
-            {"mcp_mode": "read_only", "token_name": name},
-        ):
-            try:
-                code, body = post_form(opener, base, path, fields, html)
-            except SystemExit:
-                continue
-            token = _token_from(body)
-            if token:
-                return token
-            if code in {200, 303}:
-                _, follow = request(opener, base, "GET", path)
-                token = _token_from(follow)
-                if token:
-                    return token
-    raise SystemExit("could not enable MCP / extract token")
+    code, body = request(
+        opener,
+        base,
+        "POST",
+        "/api/admin/mcp/tokens",
+        json.dumps({"mode": "read_only", "name": name}).encode(),
+        {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": origin_of(base),
+        },
+    )
+    token = _token_from(body)
+    if not token:
+        raise SystemExit(f"could not mint MCP token ({code}): {body[:400]}")
+    return token
 
 
 def _mcp_rpc(url: str, token: str, method: str, params: dict[str, Any] | None = None) -> Any:
+    if not url.endswith("/"):
+        url += "/"
     payload = json.dumps(
         {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
     ).encode()
@@ -132,7 +138,8 @@ def _mcp_rpc(url: str, token: str, method: str, params: dict[str, Any] | None = 
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
+            "Accept": MCP_ACCEPT,
+            "Origin": origin_of(url),
         },
         method="POST",
     )
@@ -268,15 +275,15 @@ def main() -> None:
     code, mcp_off = request(opener, base, "GET", "/mcp")
     assert code == 404, (code, mcp_off[:200])
     token = enable_mcp(admin, base, name="manuals")
-    names = list_tools(f"{base}/mcp", token)
+    names = list_tools(mcp_url(base), token)
     assert "ask" in names and "search_manuals" in names, names
     assert "email.send" not in names, names
-    found = call_tool(f"{base}/mcp", token, "search_manuals", {"query": QUERY})
+    found = call_tool(mcp_url(base), token, "search_manuals", {"query": QUERY})
     assert "Maple Espresso E-20" in found, found
     mcp_body = json.loads(found)
     assert mcp_body["status"] == "ok", mcp_body
     assert mcp_body["result"] == rest["text"], (mcp_body["result"], rest["text"])
-    asked = call_tool(f"{base}/mcp", token, "ask", {"text": "ping"})
+    asked = call_tool(mcp_url(base), token, "ask", {"text": "ping"})
     assert "(stub)" in asked or "ping" in asked, asked
     print("OK manuals-expert-steps")
 

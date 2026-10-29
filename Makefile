@@ -7,7 +7,7 @@ STEPS ?= scripts/manuals-expert-steps.sh
 .PHONY: build lint-bot steps
 
 build:
-	docker build --build-arg CORE=$(CORE) -t $(IMAGE) .
+	docker build --build-arg CORE=$(CORE) --build-arg IMAGE_TAG=$(IMAGE) -t $(IMAGE) .
 
 lint-bot:
 	docker run --rm \
