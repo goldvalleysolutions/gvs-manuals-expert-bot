@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -186,7 +185,7 @@ def call_tool(url: str, token: str, name: str, arguments: dict[str, Any]) -> str
 
 
 def main() -> None:
-    base, _repo, cname = sys.argv[1:4]
+    base = sys.argv[1]
     opener = _opener()
 
     print("step 1 setup")
@@ -244,12 +243,6 @@ def main() -> None:
     titles = [hit["title"] for hit in rest["results"]]
     assert "Maple Espresso E-20" in titles, titles
     assert "descale" in rest["text"].lower()
-
-    listed = subprocess.check_output(
-        ["docker", "exec", cname, "ls", "/data/manuals-expert"],
-        text=True,
-    )
-    assert "maple-espresso-e20.md" in listed, listed
 
     print("step 5 web blocked")
     assert ask(opener, base, "CALL web.browse {}")["blocked"] is True

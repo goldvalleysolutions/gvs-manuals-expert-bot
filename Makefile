@@ -18,7 +18,7 @@ lint-bot:
 
 steps:
 	@if [ ! -f "$(STEPS)" ]; then \
-		echo "warning: $(STEPS) is missing; skipping walkthrough" >&2; \
-		exit 0; \
+		echo "error: $(STEPS) is missing" >&2; \
+		exit 1; \
 	fi; \
 	"$(STEPS)" "$(IMAGE)"

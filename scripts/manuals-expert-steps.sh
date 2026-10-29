@@ -31,4 +31,14 @@ until curl -fsS "${base}/health" >/dev/null; do
   sleep 1
 done
 
-python3 "$here/scripts/manuals_expert_steps_http.py" "$base" "$here" "$name"
+docker run --rm --network container:"$name" \
+  -v "$here/scripts:/steps:ro" \
+  "$image" \
+  python /steps/manuals_expert_steps_http.py http://127.0.0.1:8080
+
+listed="$(docker exec "$name" ls /data/manuals-expert)"
+echo "$listed"
+echo "$listed" | grep -q "maple-espresso-e20.md" || {
+  echo "FAIL expected maple-espresso-e20.md in /data/manuals-expert" >&2
+  exit 1
+}

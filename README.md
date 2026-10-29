@@ -31,8 +31,7 @@ docker run -d --name manuals-expert -p 8080:8080 \
 ```
 
 `make lint-bot` runs the core image's `python -m core.config.lint /bot`.
-`make steps` runs the stub walkthrough against the built image (warns and
-exits 0 if `scripts/manuals-expert-steps.sh` is missing).
+`make steps` runs the stub walkthrough against the built image.
 
 Open <http://localhost:8080>. Every page redirects to **`/setup`** until you
 finish it. Create the bot-admin login, leave the LLM on **stub** (no key, $0),
