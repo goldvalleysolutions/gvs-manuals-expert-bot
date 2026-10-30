@@ -9,24 +9,26 @@ _Screenshot: first-boot `/setup` and the chat page after the self-test (this PR)
 
 ## Up and running in 5 minutes
 
-Until publishing is on, build from this repo (Docker or Colima, arm64 or amd64):
+The core image `ghcr.io/goldvalleysolutions/core-bot` is private on GHCR. Create a GitHub
+token with `read:packages`, then build this bot `FROM ghcr.io/goldvalleysolutions/core-bot:${CORE}`
+(`CORE=0.2`, never `latest`) from the repo root (Docker or Colima, arm64 or amd64):
 
 ```bash
-git clone git@github.com:goldvalleysolutions/gvs-box-base.git
-cd gvs-box-base
-make build BOX=manuals-expert
-docker run -d --name manuals-expert -p 8080:8080 -v manuals-expert-data:/data manuals-expert-in-a-box
+echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+
+git clone git@github.com:goldvalleysolutions/gvs-manuals-expert-bot.git
+cd gvs-manuals-expert-bot
+docker build -f bot/Dockerfile --build-arg CORE=0.2 -t manuals-expert-bot:dev .
+docker run -d --name manuals-expert -p 8080:8080 -v manuals-expert-data:/data manuals-expert-bot:dev
 ```
+
+The Dockerfile copies `bot/` to `/bot/` on top of the pinned core; no RUN steps.
 
 Open <http://localhost:8080>. Every page redirects to **`/setup`** until you finish
 it. Create the box-admin login, leave the LLM on **stub** (no key, $0), then run
 the self-test. `curl -f http://localhost:8080/health` works before and after setup.
 
-Once Mike turns publishing on (or after this role is mirrored to its own repo):
-
-```bash
-docker run -d --name manuals-expert -p 8080:8080 -v manuals-expert-data:/data goldvalleysolutions/manuals-expert-in-a-box:latest
-```
+There is no published image for this bot yet; build it locally as above.
 
 That's it. Everything you enter stays in the `manuals-expert-data` volume on your
 machine, with keys encrypted.
@@ -75,7 +77,7 @@ to the stub when reached.
 **Formula:** monthly cost ≈ chats per month × turns per chat × cost per turn × 1.1 (memory summaries).
 **Cost per turn** ≈ (input tokens × input price) + (output tokens × output price). A typical turn for this box: **~2,000** input + **~300** output tokens.
 
-This role's `box.yaml` profile is **10 chats/day** and **4 turns/chat**. On
+This role's `bot.yaml` profile is **10 chats/day** and **4 turns/chat**. On
 the stub model that is **$0**.
 
 | Usage (this role) | How often it runs | How chatty | Turns / month | Small model* | Mid model* |
@@ -95,13 +97,13 @@ the stub model that is **$0**.
 
 | Item | Where | Notes |
 |---|---|---|
-| Manifest | `boxes/manuals-expert/box.yaml` | `make lint-box BOX=manuals-expert` |
-| Role / skills | `role.md`, `skills/lookup/SKILL.md` | Seeded into `box.db` on first boot |
+| Manifest | `bot/bot.yaml` | `make lint-bot BOT=<this repo>/bot (in gvs-core-bot)` |
+| Role / skills | `role.md`, `skills/lookup/SKILL.md` | Seeded into `bot.db` on first boot |
 | Tools | `tools/search.py` | `search_manuals` (read; chat + MCP) |
 | REST | `services/search.py` | `GET /r/manuals-expert/search` |
 | Manuals | `/data/manuals-expert/` | Role-owned store; core never writes here |
 | Theme | `theme.yaml` | GVS gold/white/Inter defaults |
-| Data | `/data/box.db` + `/data/box.key` | One SQLite DB; key is 0600 |
+| Data | `/data/bot.db` + `/data/bot.key` | One SQLite DB; key is 0600 |
 | Port | `8080` | Non-root user in the image |
 
 Add your own manuals by copying `.md` files into the `manuals-expert-data`
@@ -109,8 +111,8 @@ volume under `manuals-expert/`. Search picks them up on the next query.
 
 ## Updates and backups
 
-- Update: `docker pull goldvalleysolutions/manuals-expert-in-a-box:latest`, then re-run the `docker run` with the same volume.
-- Back up: copy the `manuals-expert-data` volume. It holds `box.db`, `box.key`, and `/data/manuals-expert/`; keep them together.
+- Update: `rebuild `manuals-expert-bot:dev` (`git pull`, then the `docker build` above)`, then re-run the `docker run` with the same volume.
+- Back up: copy the `manuals-expert-data` volume. It holds `bot.db`, `bot.key`, and `/data/manuals-expert/`; keep them together.
 
 ## FAQ
 
@@ -127,3 +129,21 @@ See **box pricing:** https://goldvalleysolutions.com/boxes/pricing
 ## License
 
 Apache 2.0. See `LICENSE` and `NOTICE`. Powered by Gold Valley Solutions.
+
+## End-to-end tests (Playwright)
+
+`tests/e2e/` starts the bot on core from source (pinned to gvs-core-bot `9587ba7`) with
+uvicorn, a temp `/data` and the stub model, then drives it in Chromium at desktop
+(1280x800) and mobile (390x844) sizes. `verify-local.sh` runs it through
+`.verify-local.env`, and it must pass before merge.
+
+```bash
+git clone https://github.com/goldvalleysolutions/gvs-core-bot.git ../gvs-core-bot
+git -C ../gvs-core-bot checkout 9587ba7
+pip install -r ../gvs-core-bot/requirements.txt -r tests/e2e/requirements.txt
+python -m playwright install chromium
+GVS_CORE_DIR=../gvs-core-bot python -m pytest tests/e2e -q
+```
+
+When a test fails, a screenshot and a trace go to `tests/e2e/artifacts/` (gitignored).
+Open the trace with `python -m playwright show-trace <file>.trace.zip`.

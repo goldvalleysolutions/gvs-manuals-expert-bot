@@ -1,0 +1,5 @@
+# Playwright e2e suite (tests/e2e). Core's own requirements come from the core checkout:
+#   pip install -r "$GVS_CORE_DIR/requirements.txt" -r tests/e2e/requirements.txt
+#   python -m playwright install chromium
+pytest==9.1.1
+playwright==1.64.1
