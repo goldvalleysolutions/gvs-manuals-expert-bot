@@ -1,4 +1,4 @@
-"""Web + MCP helpers for the step scripts (core 0.2, no REST API).
+"""Web + MCP helpers for the step scripts (core 0.3, no REST API).
 
 Core removed ``/api/*``. The step scripts talk to a bot the way people and agents do:
 

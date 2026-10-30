@@ -5,7 +5,7 @@
 name: Manuals Expert in a Box
 slug: manuals-expert
 version: 0.1.0
-core: "0.2"
+core: "0.3"
 role: role.md
 skills: skills/
 tools_allowed:
