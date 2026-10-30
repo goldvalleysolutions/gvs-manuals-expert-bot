@@ -6,11 +6,11 @@
 #            CORE_IMAGE=ghcr.io/goldvalleysolutions/core-bot:${CORE} so FROM is the pin (never latest).
 #   Release: docker-bake.hcl overrides CORE_IMAGE to the bare name `core-bot`
 #            and feeds the freshly built `base` target through that named context.
-# CORE pins the core as X.Y (never latest); it must equal `core:` in box.yaml.
-ARG CORE=0.1
+# CORE pins the core as X.Y (never latest); it must equal `core:` in bot.yaml.
+ARG CORE=0.2
 ARG CORE_IMAGE=ghcr.io/goldvalleysolutions/core-bot:${CORE}
 FROM ${CORE_IMAGE}
-ARG CORE=0.1
+ARG CORE=0.2
 ARG CORE_IMAGE
 ARG IMAGE_TAG=manuals-expert-in-a-box:dev
 LABEL org.opencontainers.image.title="Manuals Expert in a Box" \

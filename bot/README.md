@@ -75,7 +75,7 @@ to the stub when reached.
 **Formula:** monthly cost ≈ chats per month × turns per chat × cost per turn × 1.1 (memory summaries).
 **Cost per turn** ≈ (input tokens × input price) + (output tokens × output price). A typical turn for this box: **~2,000** input + **~300** output tokens.
 
-This role's `box.yaml` profile is **10 chats/day** and **4 turns/chat**. On
+This role's `bot.yaml` profile is **10 chats/day** and **4 turns/chat**. On
 the stub model that is **$0**.
 
 | Usage (this role) | How often it runs | How chatty | Turns / month | Small model* | Mid model* |
@@ -95,13 +95,13 @@ the stub model that is **$0**.
 
 | Item | Where | Notes |
 |---|---|---|
-| Manifest | `boxes/manuals-expert/box.yaml` | `make lint-box BOX=manuals-expert` |
-| Role / skills | `role.md`, `skills/lookup/SKILL.md` | Seeded into `box.db` on first boot |
+| Manifest | `bot/bot.yaml` | `make lint-bot BOT=<this repo>/bot (in gvs-core-bot)` |
+| Role / skills | `role.md`, `skills/lookup/SKILL.md` | Seeded into `bot.db` on first boot |
 | Tools | `tools/search.py` | `search_manuals` (read; chat + MCP) |
 | REST | `services/search.py` | `GET /r/manuals-expert/search` |
 | Manuals | `/data/manuals-expert/` | Role-owned store; core never writes here |
 | Theme | `theme.yaml` | GVS gold/white/Inter defaults |
-| Data | `/data/box.db` + `/data/box.key` | One SQLite DB; key is 0600 |
+| Data | `/data/bot.db` + `/data/bot.key` | One SQLite DB; key is 0600 |
 | Port | `8080` | Non-root user in the image |
 
 Add your own manuals by copying `.md` files into the `manuals-expert-data`
@@ -110,7 +110,7 @@ volume under `manuals-expert/`. Search picks them up on the next query.
 ## Updates and backups
 
 - Update: `docker pull goldvalleysolutions/manuals-expert-in-a-box:latest`, then re-run the `docker run` with the same volume.
-- Back up: copy the `manuals-expert-data` volume. It holds `box.db`, `box.key`, and `/data/manuals-expert/`; keep them together.
+- Back up: copy the `manuals-expert-data` volume. It holds `bot.db`, `bot.key`, and `/data/manuals-expert/`; keep them together.
 
 ## FAQ
 
