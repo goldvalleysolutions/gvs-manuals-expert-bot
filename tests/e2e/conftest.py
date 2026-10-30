@@ -25,7 +25,9 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Browser, Page, Playwright, sync_playwright
 
-CORE_SHA = "76bae04"
+CORE_SHA = (
+    "f597d3d26f8c64985514589ab17e82b526ab134d"  # gvs-core-bot test (PR 29 merged)
+)
 REPO = Path(__file__).resolve().parents[2]
 ARTIFACTS = Path(__file__).resolve().parent / "artifacts"
 sys.path.insert(0, str(REPO / "scripts"))
@@ -146,6 +148,12 @@ class Bot:
                 "select value from settings where key='bot_id'"
             ).fetchone()[0]
 
+    def set_setting(self, key: str, value: str) -> None:
+        with sqlite3.connect(self.data / "bot.db") as db:
+            db.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key, value)
+            )
+
     def root_login_url(self) -> str:
         """A signed one-time GVS root login link (throwaway key from core_copy)."""
         import secrets
@@ -221,8 +229,14 @@ def page(browser: Browser, request) -> Iterator[Page]:
     ctx.tracing.start(screenshots=True, snapshots=True)
     pg = ctx.new_page()
     errors: list[str] = []
+    csp: list[str] = []
     pg.on("pageerror", lambda e: errors.append(str(e)))
+    pg.on(
+        "console",
+        lambda m: csp.append(m.text) if "Content Security Policy" in m.text else None,
+    )
     pg.js_errors = errors  # type: ignore[attr-defined]
+    pg.csp_errors = csp  # type: ignore[attr-defined]
     yield pg
     rep = getattr(request.node, "rep_call", None)
     if rep is not None and rep.failed:

@@ -1,7 +1,7 @@
 """Manuals Expert e2e: setup, chat with search, the manual search page, MCP.
 
-The search route is admin-only for now (core 0.2 default, no ``@public``). It will
-follow core's access policy once the access/users PR lands.
+The search route is ``@user_level``: it follows the bot's access policy
+(test_access_policy.py covers Anyone and Signed-in users only).
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import urllib.parse
 
 from playwright.sync_api import Page, expect
 from steps_web import mcp_call, mcp_list
-from ui import admin_login, admin_web, chat, mcp_initialize, setup_ui
+from ui import admin_web, chat, mcp_initialize, setup_ui
 
 BRAND = "Manuals Expert"
 HTTP_SETUP: dict = {}
@@ -41,14 +41,14 @@ def test_chat_tools(page: Page, ready_bot) -> None:
     assert not page.js_errors
 
 
-def test_search_page_admin_only(page: Page, ready_bot) -> None:
-    assert page.goto(ready_bot.base + SEARCH).status == 404  # logged out: blocked
-    admin_login(page, ready_bot.base)
+def test_search_page(page: Page, ready_bot) -> None:
+    """/search is @user_level: under the default Anyone policy it opens logged out."""
     resp = page.goto(ready_bot.base + SEARCH)
     assert resp.status == 200
     data = json.loads(page.locator("body").inner_text())
     assert "Maple Espresso E-20" in [hit["title"] for hit in data["results"]]
     assert "descale" in data["text"].lower()
+    assert not page.csp_errors, page.csp_errors
 
 
 def test_mcp_initialize_and_tools(ready_bot) -> None:

@@ -1,7 +1,7 @@
 """Manuals Expert walkthrough over web chat, the admin forms and MCP (no REST API).
 
-The manual search under /r/manuals-expert/ is admin-only (core 0.2 default, no
-``@public``), so a visitor gets 404 and parity is checked from the admin session.
+The manual search under /r/manuals-expert/ is ``@user_level``: it follows the access
+policy (Anyone: opens logged out; Signed-in users only: /login first).
 
 Usage: manuals_expert_steps_http.py BASE SMTP_HOST SMTP_PORT CTL BOT_ID
 (SMTP and the root key are unused here; the signature matches the other bots.)
@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from steps_web import Web, mcp_call, mcp_list
+from steps_web import Web, check_access_policy, mcp_call, mcp_list
 
 
 def admin_checks(base: str, brand: str) -> Web:
@@ -51,13 +51,12 @@ def main() -> None:
     print("step 3 search_manuals")
     assert web.ask('CALL search_manuals {"query":"' + QUERY + '"}')["blocked"] is False
 
-    print("step 4 search route parity (admin-only)")
+    print("step 4 search route parity (@user_level: follows the access policy)")
     path = "/r/manuals-expert/search?q=" + urllib.parse.quote(QUERY)
-    code, _ = web.get(path)
-    assert code == 404, code
     admin = Web(base)
     admin.admin_login()
-    code, raw = admin.get(path)
+    check_access_policy(base, admin, ["/", path])
+    code, raw = web.get(path)
     assert code == 200, (code, raw[:300])
     route = json.loads(raw)
     titles = [hit["title"] for hit in route["results"]]

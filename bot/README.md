@@ -132,14 +132,14 @@ Apache 2.0. See `LICENSE` and `NOTICE`. Powered by Gold Valley Solutions.
 
 ## End-to-end tests (Playwright)
 
-`tests/e2e/` starts the bot on core from source (pinned to gvs-core-bot `76bae04`) with
+`tests/e2e/` starts the bot on core from source (pinned to gvs-core-bot `f597d3d`) with
 uvicorn, a temp `/data` and the stub model, then drives it in Chromium at desktop
 (1280x800) and mobile (390x844) sizes. `verify-local.sh` runs it through
 `.verify-local.env`, and it must pass before merge.
 
 ```bash
 git clone https://github.com/goldvalleysolutions/gvs-core-bot.git ../gvs-core-bot
-git -C ../gvs-core-bot checkout 76bae04
+git -C ../gvs-core-bot checkout f597d3d
 pip install -r ../gvs-core-bot/requirements.txt -r tests/e2e/requirements.txt
 python -m playwright install chromium
 GVS_CORE_DIR=../gvs-core-bot python -m pytest tests/e2e -q

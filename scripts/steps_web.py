@@ -25,7 +25,7 @@ from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any
 
-ADMIN = {"username": "admin", "password": "secret12"}
+ADMIN = {"username": "admin", "password": "gvs-admin-pass-12"}  # core: 12+ characters
 CSRF_RE = re.compile(r"name=csrf value='([^']+)'")
 NEW_TOKEN_RE = re.compile(r"id=new-token-value>([^<]+)<")
 
@@ -156,6 +156,29 @@ class Web:
         if code != 200 or "Social login is planned later" in page:
             fail(f"admin login did not take ({code})")
 
+    def set_policy(self, policy: str) -> None:
+        """Admin -> Users: 'anyone' or 'signed_in'."""
+        self.form(
+            "/admin/users",
+            {"action": "policy", "access_policy": policy},
+            "/admin?tab=users",
+        )
+
+    def add_user(self, name: str, password: str) -> None:
+        self.form(
+            "/admin/users",
+            {"action": "add", "new_username": name, "new_password": password},
+            "/admin?tab=users",
+        )
+        _, page = self.get("/admin?tab=users")
+        if name not in page:
+            fail(f"user {name} not listed after add")
+
+    def user_login(self, name: str, password: str) -> None:
+        self.form(
+            "/login", {"username": name, "password": password, "next": "/"}
+        )  # 401 fails
+
     def set_mcp_access(self, access: str) -> None:
         self.form("/admin/mcp", {"access": access}, "/admin?tab=mcp")
 
@@ -177,8 +200,17 @@ class Web:
         self.set_mcp_access(mode)
         return self.issue_mcp_token(name)
 
-    def approve(self, aid: str) -> None:
-        self.form(f"/admin/approvals/{aid}/approve", {}, "/admin/approvals")
+    def approve(self, aid: str) -> str:
+        """Approve in the chat UI's approval card (bot admin, CSRF); returns the new status."""
+        self.form(
+            f"/chat/approvals/{aid}", {"decision": "approve", "back": "chat"}, "/"
+        )
+        code, raw, _ = self.request(
+            "GET", f"/chat/approvals/{aid}", headers={"Accept": "application/json"}
+        )
+        if code != 200:
+            fail(f"GET /chat/approvals/{aid} {code}")
+        return json.loads(raw)["status"]
 
     def model_switch_gated(self) -> None:
         """An untested model change is refused, the key never echoes, then back to stub."""
@@ -302,3 +334,28 @@ def load_cookies(web: Web, path: Path) -> None:
                 {},
             )
         )
+
+
+def check_access_policy(base: str, admin: Web, paths: list[str]) -> None:
+    """Anyone: paths open logged out. Signed-in users only: login page, then they open."""
+    admin.set_policy("anyone")
+    visitor = Web(base)
+    for path in paths:
+        code, page = visitor.get(path)
+        if code != 200 or "Sign in to" in page:
+            fail(f"Anyone: {path} did not open logged out ({code})")
+    admin.set_policy("signed_in")
+    admin.add_user("dana", "dana-pass-12345")
+    try:
+        visitor = Web(base)
+        for path in paths:
+            code, page = visitor.get(path)
+            if "Sign in to" not in page:
+                fail(f"Signed-in: {path} did not redirect to /login ({code})")
+        visitor.user_login("dana", "dana-pass-12345")
+        for path in paths:
+            code, page = visitor.get(path)
+            if code != 200 or "Sign in to" in page:
+                fail(f"Signed-in: {path} did not open for the user ({code})")
+    finally:
+        admin.set_policy("anyone")

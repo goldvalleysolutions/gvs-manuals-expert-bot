@@ -6,7 +6,8 @@ import re
 
 from playwright.sync_api import Locator, Page, expect
 
-ADMIN_PASSWORD = "secret12"
+ADMIN_PASSWORD = "gvs-admin-pass-12"  # core: 12+ characters
+USER, USER_PASSWORD = "dana", "dana-pass-12345"
 
 
 def setup_ui(
@@ -14,6 +15,7 @@ def setup_ui(
     base: str,
     smtp: dict[str, str] | None = None,
     wizard: dict[str, str] | None = None,
+    policy: str = "anyone",
 ) -> list[str]:
     """Walk /setup through the browser; returns the step names seen."""
     page.goto(base + "/setup")
@@ -28,6 +30,9 @@ def setup_ui(
         if step == "bot_admin":
             form.locator("#password").fill(ADMIN_PASSWORD)
             form.locator("#email").fill("admin@example.com")
+        elif step == "access":
+            expect(page.locator("body")).to_contain_text("Who can use this bot?")
+            page.click(f"label.choice:has(#policy-{policy})")
         elif step == "model":
             form.locator("#provider").select_option("stub")
             form.locator("#test-model").click()
@@ -117,3 +122,13 @@ def admin_web(base: str):
     web = Web(base)
     web.admin_login()
     return web
+
+
+def user_login(page: Page) -> None:
+    """Sign in as the bot user on /login (keeps the ?next= the redirect added)."""
+    if "/login" not in page.url:
+        page.goto(page.url.split("/", 3)[0] + "//" + page.url.split("/")[2] + "/login")
+    page.fill("#username", USER)
+    page.fill("#password", USER_PASSWORD)
+    page.locator("form[action='/login'] button:not(.password-toggle)").click()
+    page.wait_for_load_state()
