@@ -26,7 +26,7 @@ import pytest
 from playwright.sync_api import Browser, Page, Playwright, sync_playwright
 
 CORE_SHA = (
-    "f597d3d26f8c64985514589ab17e82b526ab134d"  # gvs-core-bot test (PR 29 merged)
+    "a1a5b5d0b60d5cbe514b7b2f4279274d476db88d"  # gvs-core-bot test, core 0.3.0 (PR 30)
 )
 REPO = Path(__file__).resolve().parents[2]
 ARTIFACTS = Path(__file__).resolve().parent / "artifacts"
