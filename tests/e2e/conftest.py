@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Browser, Page, Playwright, sync_playwright
 
-CORE_SHA = "9587ba7"
+CORE_SHA = "76bae04"
 REPO = Path(__file__).resolve().parents[2]
 ARTIFACTS = Path(__file__).resolve().parent / "artifacts"
 sys.path.insert(0, str(REPO / "scripts"))
