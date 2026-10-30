@@ -9,24 +9,26 @@ _Screenshot: first-boot `/setup` and the chat page after the self-test (this PR)
 
 ## Up and running in 5 minutes
 
-Until publishing is on, build from this repo (Docker or Colima, arm64 or amd64):
+The core image `ghcr.io/goldvalleysolutions/core-bot` is private on GHCR. Create a GitHub
+token with `read:packages`, then build this bot `FROM ghcr.io/goldvalleysolutions/core-bot:${CORE}`
+(`CORE=0.2`, never `latest`) from the repo root (Docker or Colima, arm64 or amd64):
 
 ```bash
-git clone git@github.com:goldvalleysolutions/gvs-core-bot.git
-cd gvs-core-bot
-make build BOX=manuals-expert
-docker run -d --name manuals-expert -p 8080:8080 -v manuals-expert-data:/data manuals-expert-in-a-box
+echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+
+git clone git@github.com:goldvalleysolutions/gvs-manuals-expert-bot.git
+cd gvs-manuals-expert-bot
+docker build -f bot/Dockerfile --build-arg CORE=0.2 -t manuals-expert-bot:dev .
+docker run -d --name manuals-expert -p 8080:8080 -v manuals-expert-data:/data manuals-expert-bot:dev
 ```
+
+The Dockerfile copies `bot/` to `/bot/` on top of the pinned core; no RUN steps.
 
 Open <http://localhost:8080>. Every page redirects to **`/setup`** until you finish
 it. Create the box-admin login, leave the LLM on **stub** (no key, $0), then run
 the self-test. `curl -f http://localhost:8080/health` works before and after setup.
 
-Once Mike turns publishing on (or after this role is mirrored to its own repo):
-
-```bash
-docker run -d --name manuals-expert -p 8080:8080 -v manuals-expert-data:/data goldvalleysolutions/manuals-expert-in-a-box:latest
-```
+There is no published image for this bot yet; build it locally as above.
 
 That's it. Everything you enter stays in the `manuals-expert-data` volume on your
 machine, with keys encrypted.
@@ -109,7 +111,7 @@ volume under `manuals-expert/`. Search picks them up on the next query.
 
 ## Updates and backups
 
-- Update: `docker pull goldvalleysolutions/manuals-expert-in-a-box:latest`, then re-run the `docker run` with the same volume.
+- Update: `rebuild `manuals-expert-bot:dev` (`git pull`, then the `docker build` above)`, then re-run the `docker run` with the same volume.
 - Back up: copy the `manuals-expert-data` volume. It holds `bot.db`, `bot.key`, and `/data/manuals-expert/`; keep them together.
 
 ## FAQ

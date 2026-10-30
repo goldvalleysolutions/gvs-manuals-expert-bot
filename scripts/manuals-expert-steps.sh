@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Manuals Expert walkthrough against a built manuals-expert-in-a-box image.
+# Manuals Expert walkthrough against a built manuals-expert-bot:dev image.
 # Stub LLM, MCP, tool + REST parity. Usage: scripts/manuals-expert-steps.sh <image> [host-port]
 set -euo pipefail
 
