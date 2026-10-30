@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 from typing import Any
 
+from core.sdk import user_level
 from fastapi import APIRouter, Query, Request
 
 _TOOLS = Path(__file__).resolve().parent.parent / "tools" / "search.py"
@@ -25,6 +26,7 @@ router = APIRouter()
 
 
 @router.get("/search")
+@user_level  # follows the bot's access policy (Anyone / Signed-in users only)
 def search(
     request: Request,
     q: str = Query(default="", description="Words to find in the manuals"),
