@@ -1,4 +1,4 @@
-"""Manuals Expert e2e: setup, chat with search, the manual search page, MCP.
+"""Manuals Expert Bot e2e: setup, chat with search, the manual search page, MCP.
 
 The search route is ``@user_level``: it follows the bot's access policy
 (test_access_policy.py covers Anyone and Signed-in users only).
@@ -13,7 +13,7 @@ from playwright.sync_api import Page, expect
 from steps_web import mcp_call, mcp_list
 from ui import admin_web, chat, mcp_initialize, setup_ui
 
-BRAND = "Manuals Expert"
+BRAND = "Manuals Expert Bot"
 HTTP_SETUP: dict = {}
 QUERY = "descale espresso"
 SEARCH = "/r/manuals-expert/search?q=" + urllib.parse.quote(QUERY)
@@ -28,6 +28,7 @@ def test_setup(page: Page, fresh_bot) -> None:
     ), seen
     page.goto(fresh_bot.base + "/")
     expect(page.locator("body")).to_contain_text(BRAND)
+    expect(page.locator("body")).not_to_contain_text("in a Box")
     assert not page.js_errors
 
 

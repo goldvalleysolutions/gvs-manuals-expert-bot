@@ -1,4 +1,4 @@
-Custom tools for this box (0–3 `*.py` files), registered through `core.sdk`.
+Custom tools for this bot (0–3 `*.py` files), registered through `core.sdk`.
 
 `search_manuals` (read, chat + MCP) looks up the role-owned manuals under
 `/data/manuals-expert/`. The matching REST route is
