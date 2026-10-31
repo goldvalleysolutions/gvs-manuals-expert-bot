@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Manuals Expert walkthrough against a built image. Stub LLM, fake SMTP, MCP.
+# Manuals Expert Bot walkthrough against a built image. Stub LLM, fake SMTP, MCP.
 # No REST API: the driver uses web chat, the admin forms (with CSRF) and the MCP client.
 # It runs inside the image so core.auth.token / mcp / httpx2 / cryptography come from core.
 # The Playwright suite in tests/e2e is the required pre-merge check; this checks the image.

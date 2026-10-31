@@ -1,6 +1,6 @@
-# Manuals Expert in a Box
+# Manuals Expert Bot
 
-A small-business equipment clerk that answers from the manuals on the box:
+A small-business equipment clerk that answers from the manuals on the bot:
 seeded demo docs plus any `.md` files you drop in `/data/manuals-expert/`.
 One image, `/setup`, memory, allowlisted tools, and the Gold Valley Solutions
 gold theme. It does not browse the web.
@@ -25,7 +25,7 @@ docker run -d --name manuals-expert -p 8080:8080 -v manuals-expert-data:/data ma
 The Dockerfile copies `bot/` to `/bot/` on top of the pinned core; no RUN steps.
 
 Open <http://localhost:8080>. Every page redirects to **`/setup`** until you finish
-it. Create the box-admin login, leave the LLM on **stub** (no key, $0), then run
+it. Create the bot-admin login, leave the LLM on **stub** (no key, $0), then run
 the self-test. `curl -f http://localhost:8080/health` works before and after setup.
 
 There is no published image for this bot yet; build it locally as above.
@@ -38,14 +38,14 @@ machine, with keys encrypted.
 Do these on the running image. CI runs the walkthrough on amd64 and arm64.
 Stub LLM only — no provider keys.
 
-1. **`/setup`** — stub model, no LLM key. No tool credentials on this box.
+1. **`/setup`** — stub model, no LLM key. No tool credentials on this bot.
 2. **Clock** — ask the time. `clock.now` runs and is logged.
 3. **Search** — ask how to descale the Maple Espresso E-20. `search_manuals`
    returns the seeded page.
 4. **REST** — `GET /r/manuals-expert/search?q=descale` returns the same hits.
 5. **Web browse blocked** — ask it to search the web. The call is refused and
    logged `blocked` / `not_allowed`.
-6. **Box admin 404** — as box admin, `/gvs/role`, `/gvs/skills`, `/gvs/memory`
+6. **Bot admin 404** — as bot admin, `/gvs/role`, `/gvs/skills`, `/gvs/memory`
    and `/gvs/activity` are 404.
 7. **MCP** — MCP is **off** until you turn it on in **read only** and issue a
    token. An MCP client at `/mcp` can `ask`, `search`, `list_items`, and
@@ -66,16 +66,16 @@ Stub LLM only — no provider keys.
 | Docker | Yes | docker.com or Colima | Free |
 | AI provider key (OpenRouter, OpenAI, xAI or Anthropic) | For real answers (the stub works without one) | The provider's website | Pay per use; see below |
 
-Default spend cap is **$25/month**. At the cap the box falls back to stub.
+Default spend cap is **$25/month**. At the cap the bot falls back to stub.
 
 ## Estimated monthly cost
 
-You pay your AI provider directly. The box itself is free. A spend cap
+You pay your AI provider directly. The bot itself is free. A spend cap
 (**$25/month by default**, change it in admin) stops paid calls and falls back
 to the stub when reached.
 
 **Formula:** monthly cost ≈ chats per month × turns per chat × cost per turn × 1.1 (memory summaries).
-**Cost per turn** ≈ (input tokens × input price) + (output tokens × output price). A typical turn for this box: **~2,000** input + **~300** output tokens.
+**Cost per turn** ≈ (input tokens × input price) + (output tokens × output price). A typical turn for this bot: **~2,000** input + **~300** output tokens.
 
 This role's `bot.yaml` profile is **10 chats/day** and **4 turns/chat**. On
 the stub model that is **$0**.
@@ -90,8 +90,8 @@ the stub model that is **$0**.
 
 ## Admin
 
-- **Box admin** (you): AI provider, key and model; tool credentials; theme (name, logo, colors); spend cap; health.
-- **You get box admin; that's the top level for self-hosted boxes.** Root (role, skills, memory, logs) is held by Gold Valley Solutions only and is never handed out. It needs a token signed by GVS, so GVS can only use it if you give GVS access to your box (e.g. a setup or hosting engagement).
+- **Bot admin** (you): AI provider, key and model; tool credentials; theme (name, logo, colors); spend cap; health.
+- **You get bot admin; that's the top level for self-hosted bots.** Root (role, skills, memory, logs) is held by Gold Valley Solutions only and is never handed out. It needs a token signed by GVS, so GVS can only use it if you give GVS access to your bot (e.g. a setup or hosting engagement).
 
 ## Configuration
 
@@ -119,12 +119,12 @@ volume under `manuals-expert/`. Search picks them up on the next query.
 - **Working with health records?** When you run a project yourself, you choose an AI provider and host that fit your compliance needs. Our hosting and builds don't process patient health information.
 - **Can it browse the web?** No. That is not on `tools_allowed` and a call is refused and logged.
 - **Where do the manuals live?** In the role store `/data/manuals-expert/`. A tiny demo corpus is copied there on first search. The core SQLite DB is not used for the pages.
-- **Does this box send email?** No. It does not include `email.send` or SMTP.
+- **Does this bot send email?** No. It does not include `email.send` or SMTP.
 
 ## Help and paid services
 
-Gold Valley Solutions offers paid **setup, configuration, training and hosting** for every box. Setup and configuration cost the same for every box type.
-See **box pricing:** https://goldvalleysolutions.com/boxes/pricing
+Gold Valley Solutions offers paid **setup, configuration, training and hosting** for every bot. Setup and configuration cost the same for every bot.
+See **Gold Valley Bots pricing:** https://www.goldvalleysolutions.com/pricing/gold-valley-bots.html
 
 ## License
 

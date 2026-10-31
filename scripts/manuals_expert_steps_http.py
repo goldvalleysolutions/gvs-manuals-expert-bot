@@ -1,4 +1,4 @@
-"""Manuals Expert walkthrough over web chat, the admin forms and MCP (no REST API).
+"""Manuals Expert Bot walkthrough over web chat, the admin forms and MCP (no REST API).
 
 The manual search under /r/manuals-expert/ is ``@user_level``: it follows the access
 policy (Anyone: opens logged out; Signed-in users only: /login first).
@@ -30,7 +30,7 @@ def admin_checks(base: str, brand: str) -> Web:
 
 import urllib.parse
 
-BRAND = "Manuals Expert"
+BRAND = "Manuals Expert Bot"
 QUERY = "descale espresso"
 
 
@@ -43,7 +43,7 @@ def main() -> None:
     assert "SMTP_HOST" not in page
     web.setup()
     code, home = web.get("/")
-    assert code == 200 and BRAND in home and "Powered by Gold Valley Solutions" in home
+    assert code == 200 and BRAND in home and "in a Box" not in home and "Powered by Gold Valley Solutions" in home
 
     print("step 2 clock")
     assert web.ask("CALL clock.now {}")["blocked"] is False

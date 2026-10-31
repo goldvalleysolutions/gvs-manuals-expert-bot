@@ -35,7 +35,7 @@ E2E_REQUIRED=${GVS_E2E_REQUIRED:-0}
 
 have() { command -v "$1" >/dev/null 2>&1; }
 add_row() { ROWS+=("| \`$1\` | $2 | $3 |"); }
-log_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-60; printf -- '-%08x' "$(printf '%s' "$1" | cksum | awk '{print $1}')"; }
+log_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-60 | tr -d '\n'; printf -- '-%08x' "$(printf '%s' "$1" | cksum | awk '{print $1}')"; }
 skip() { add_row "$1" "SKIP ($2)" "0s"; }
 run() {
   local label=$1; shift

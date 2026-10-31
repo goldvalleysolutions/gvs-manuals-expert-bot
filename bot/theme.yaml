@@ -1,3 +1,3 @@
 # Keep the core GVS default (gold #EDAA4B, white, slate-900, Inter).
-# Box admin can still override colors live in /admin.
-brand_name: Manuals Expert in a Box
+# Bot admin can still override colors live in /admin.
+brand_name: Manuals Expert Bot
