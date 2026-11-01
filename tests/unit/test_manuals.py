@@ -796,6 +796,66 @@ def test_bounded_class_regexes_are_linear(s, case: str) -> None:
     assert time.monotonic() - t0 < 2.0, case
 
 
+def _expanding_font_pdf(content: bytes) -> bytes:
+    """Font F1: 1-byte codes, 'A' -> 64 x 'A' (256 hex digits), content Flate-compressed."""
+    cmap = (
+        b"begincodespacerange <00> <FF> endcodespacerange "
+        b"beginbfchar <41> <" + b"0041" * 64 + b"> endbfchar"
+    )
+    z = zlib.compress(content)
+    return (
+        b"%PDF-1.4\n1 0 obj << /Type /Font /ToUnicode 2 0 R >> endobj\n"
+        b"2 0 obj << /Length "
+        + str(len(cmap)).encode()
+        + b" >>\nstream\n"
+        + cmap
+        + b"\nendstream\nendobj\n"
+        b"3 0 obj << /Resources << /Font << /F1 1 0 R >> >> >> endobj\n"
+        b"4 0 obj << /Length " + str(len(z)).encode() + b" /Filter /FlateDecode >>\n"
+        b"stream\n" + z + b"\nendstream\nendobj\n%%EOF\n"
+    )
+
+
+@pytest.mark.parametrize("kind", ["literal_30mb", "hex_15mb"])
+def test_cmap_expansion_is_bounded(s, kind: str) -> None:
+    """Panel r4: 1 byte -> 64 chars built 2 GB strings before the Tj/ET text cap."""
+    import time
+    import tracemalloc
+
+    if kind == "literal_30mb":
+        content = b"BT /F1 12 Tf (" + b"A" * 30_000_000 + b") Tj ET"
+    else:
+        content = b"BT /F1 12 Tf <" + b"41" * 7_500_000 + b"> Tj ET"
+    pdf = _expanding_font_pdf(content)
+    tracemalloc.start()
+    t0 = time.monotonic()
+    try:
+        text = s.pdf_text(pdf)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert time.monotonic() - t0 < 2.0, kind
+    assert peak < 200 * 1024 * 1024, (kind, peak)
+    assert 0 < len(text) <= s.MAX_TEXT + 1
+
+
+def test_cmap_decode_stops_at_limit(s) -> None:
+    cmap = s.CMap(1, {0x41: "x" * 64})
+    assert cmap.decode(b"A" * 1_000_000, 100) == "x" * 100
+
+
+def test_cmap_destination_capped_at_32_hex_digits(s) -> None:
+    long = b"0041" * 64  # 256 hex digits = 64 chars
+    cmap = s.parse_cmap(
+        b"beginbfchar <41> <" + long + b"> endbfchar "
+        b"beginbfrange <42> <43> <" + long + b"> endbfrange "
+        b"beginbfrange <44> <44> [<" + long + b">] endbfrange"
+    )
+    assert cmap.decode(b"A") == "A" * 8
+    assert cmap.decode(b"B") == "A" * 8 and cmap.decode(b"C") == "A" * 7 + "B"
+    assert cmap.decode(b"D") == "A" * 8
+
+
 def test_cmap_one_byte_fallback_without_codespacerange(s) -> None:
     cmap = s.parse_cmap(b"beginbfchar <41> <0058> <42> <0059> endbfchar")
     assert cmap.width == 1 and cmap.decode(b"AB") == "XY"

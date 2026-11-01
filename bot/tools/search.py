@@ -272,15 +272,24 @@ class CMap:
         self.width = width
         self.codes = codes
 
-    def decode(self, raw: bytes) -> str:
+    def decode(self, raw: bytes, limit: int = MAX_TEXT) -> str:
+        """Decode at most ``limit`` chars; one code can map to several (up to MAX_DST)."""
         w = self.width
         out = []
-        for i in range(0, len(raw) - w + 1, w):
+        n = 0
+        for i in range(0, min(len(raw), limit * w) - w + 1, w):
             code = int.from_bytes(raw[i : i + w], "big")
-            out.append(self.codes.get(code, ""))
-        return "".join(out)
+            piece = self.codes.get(code, "")
+            out.append(piece)
+            n += len(piece)
+            if n >= limit:
+                break
+        return "".join(out)[:limit]
 
 
+MAX_DST_HEX = (
+    32  # CMap destination per code: 32 hex digits = 8 UTF-16 units, rest dropped
+)
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
@@ -295,7 +304,7 @@ def _char(cp: int) -> str:
 
 def _utf16(hexd: bytes) -> str:
     try:
-        raw = bytes.fromhex(hexd.decode())
+        raw = bytes.fromhex(hexd[:MAX_DST_HEX].decode())
     except ValueError:
         return ""
     return no_surrogates(raw.decode("utf-16-be", errors="replace"))
@@ -412,8 +421,22 @@ def _pdf_strings(
     cmap: CMap | None = None
     last_name = b""
 
+    pend_n = 0  # chars in ``pending`` (not yet in ``used``)
+
+    def left() -> int:
+        return max(limit - used - pend_n, 0)
+
     def text_of(raw: bytes) -> str:
-        return cmap.decode(raw) if cmap is not None else _plain(raw)
+        # Decode only what still fits: no full-size string before the Tj/ET caps.
+        room = left()
+        if cmap is not None:
+            return cmap.decode(raw[: room * cmap.width], room)
+        return _plain(raw[: room * 2 + 2])[:room]
+
+    def keep(text: str) -> None:
+        nonlocal pend_n
+        pending.append(text)
+        pend_n += len(text)
 
     toks = map(re.Match.group, _TOK.finditer(content))  # no generator frame per token
     for tok in toks:
@@ -428,7 +451,8 @@ def _pdf_strings(
                         break
                 buf += t
             if in_bt:
-                pending.append(text_of(_pdf_unescape_bytes(bytes(buf))))
+                need = left() * (cmap.width if cmap else 2) + 2
+                keep(text_of(_pdf_unescape_bytes(bytes(buf), need)))
         elif tok == b"<":
             buf = bytearray()
             for t in toks:
@@ -437,14 +461,14 @@ def _pdf_strings(
                 buf += t
             raw = _hex_bytes(bytes(buf)) if in_bt and buf else None
             if raw:
-                pending.append(text_of(raw))
+                keep(text_of(raw))
         elif tok.startswith(b"/"):
             last_name = tok
         elif tok == b"Tf":
             cmap = fonts.get(last_name)
         elif not in_bt:
             in_bt = tok == b"BT"
-            line, pending = [], []
+            line, pending, pend_n = [], [], 0
         elif tok == b"ET":
             out.append("".join(line))
             used += len(out[-1])
@@ -457,7 +481,7 @@ def _pdf_strings(
             for piece in pending:
                 line.append(piece)
                 used += len(piece)
-            pending = []
+            pending, pend_n = [], 0
             if used >= limit:  # S4: cap inside the per-string loop
                 out.append("".join(line))
                 break
@@ -469,27 +493,33 @@ def _pdf_strings(
 _ESC = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"(": b"(", b")": b")", b"\\": b"\\"}
 
 
-def _pdf_unescape_bytes(raw: bytes) -> bytes:
+def _pdf_unescape_bytes(raw: bytes, limit: int | None = None) -> bytes:
+    """Unescape a literal string; plain runs are copied with bytes.find, and at most
+    ``limit`` output bytes are produced."""
     res = bytearray()
-    i = 0
-    while i < len(raw):
-        ch = raw[i : i + 1]
-        if ch == b"\\" and i + 1 < len(raw):
-            nxt = raw[i + 1 : i + 2]
-            if nxt in _ESC:
-                res += _ESC[nxt]
-                i += 2
-                continue
-            octal = re.match(rb"[0-7]{1,3}", raw[i + 1 : i + 4])
-            if octal:
-                res.append(int(octal.group(0), 8) & 0xFF)
-                i += 1 + len(octal.group(0))
-                continue
-            i += 1
+    cap = len(raw) if limit is None else limit
+    i, n = 0, len(raw)
+    while i < n and len(res) < cap:
+        j = raw.find(b"\\", i)
+        if j < 0:
+            j = n
+        res += raw[i:j]
+        i = j
+        if i >= n - 1:
+            res += raw[i:]  # a trailing lone backslash is kept as-is
+            break
+        nxt = raw[i + 1 : i + 2]
+        if nxt in _ESC:
+            res += _ESC[nxt]
+            i += 2
             continue
-        res += ch
+        octal = re.match(rb"[0-7]{1,3}", raw[i + 1 : i + 4])
+        if octal:
+            res.append(int(octal.group(0), 8) & 0xFF)
+            i += 1 + len(octal.group(0))
+            continue
         i += 1
-    return bytes(res)
+    return bytes(res[:cap])
 
 
 def _pdf_unescape(raw: bytes) -> str:
