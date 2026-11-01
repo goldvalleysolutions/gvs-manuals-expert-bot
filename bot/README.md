@@ -193,6 +193,10 @@ Apache 2.0. See `LICENSE` and `NOTICE`. Powered by Gold Valley Solutions.
 
 The image is `FROM goldvalleysolutions/core-bot:0.3` (Docker Hub) plus this `bot/` folder,
 copy-only. Build: `docker build -f bot/Dockerfile -t goldvalleysolutions/manuals-expert-bot:0.1.0 .`
+Publishing: `.github/workflows/publish.yml` pushes `goldvalleysolutions/manuals-expert-bot`
+as `X.Y.Z` and `X.Y` (from `version:` in `bot/bot.yaml`, never `latest`; linux/amd64 + linux/arm64)
+only on push to `main`, i.e. when test is merged into main. It needs the `DOCKERHUB_USERNAME`
+and `DOCKERHUB_TOKEN` secrets and fails naming any that is missing. A manual run is a build-only dry run.
 Unit tests: `GVS_CORE_DIR=<core checkout> python -m pytest tests/unit`.
 All checks: `GVS_E2E_REQUIRED=1 scripts/verify-local.sh`.
 
