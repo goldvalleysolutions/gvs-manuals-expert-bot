@@ -216,7 +216,8 @@ async def upload(request: Request) -> Response:
     store = request.app.state.store
     folder = _search.ensure_store(Path(store.data_dir))
     dest = folder / name
-    if dest.exists():
+    first = not _search.manual_files(folder)
+    if not await run_in_threadpool(_write_new, dest, data):
         store.log(
             actor.name,
             "manuals.upload_refused",
@@ -224,10 +225,18 @@ async def upload(request: Request) -> Response:
             source="web",
         )
         return _back("exists", name)
-    first = not _search.manual_files(folder)
-    dest.write_bytes(data)
     store.log(actor.name, "manuals.upload", f"file={name}", source="web")
     return _back("added_first" if first else "added", name)
+
+
+def _write_new(dest: Path, data: bytes) -> bool:
+    """Create ``dest`` atomically ("xb"); False if it already exists (never overwrites)."""
+    try:
+        with open(dest, "xb") as fh:
+            fh.write(data)
+    except FileExistsError:
+        return False
+    return True
 
 
 def _back(code: str, name: str = "") -> Response:
