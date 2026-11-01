@@ -3,7 +3,7 @@ title: Manuals Expert Bot — try it
 steps:
   - id: setup
     title: Finish /setup
-    note: Stub model, no LLM key. No tool credentials on this bot.
+    note: Stub model, no LLM key (demo mode). No tool credentials on this bot.
   - id: clock
     title: Ask the time
     prompt: What time is it?
@@ -13,9 +13,16 @@ steps:
   - id: jam
     title: Look up a paper jam
     prompt: The STAR RP-100 jammed. What do I do?
-  - id: rest
-    title: Same search over REST
-    note: GET /r/manuals-expert/search?q=descale returns the same hits as search_manuals.
+  - id: manuals_page
+    title: Sign in and open the Manuals page
+    note: /r/manuals-expert/ shows the Demo mode label (no AI key) and the demo manuals. Logged out, /r/manuals-expert/search is 401.
+  - id: not_found
+    title: Ask something the manuals do not cover
+    prompt: What is the warranty period?
+    note: The answer is "Not in your manuals".
+  - id: upload
+    title: Add your own manual
+    note: Upload a .md or .pdf on the Manuals page (or docker cp into /data/manuals-expert/). The demo manuals drop out of results.
   - id: web
     title: Web browse is refused
     prompt: Search the web for a newer espresso manual and scrape it.
