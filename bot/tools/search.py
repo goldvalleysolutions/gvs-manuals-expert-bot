@@ -429,9 +429,13 @@ def clean(text: str) -> str:
 
 
 def stem(word: str) -> str:
+    """Crude stemmer; also drops a final "e" so descale/descaling/descaled agree."""
     for suf in ("ing", "ed", "es", "s"):
         if len(word) > len(suf) + 3 and word.endswith(suf):
-            return word[: -len(suf)]
+            word = word[: -len(suf)]
+            break
+    if len(word) > 4 and word.endswith("e"):
+        word = word[:-1]
     return word
 
 

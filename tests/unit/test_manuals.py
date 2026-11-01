@@ -340,6 +340,20 @@ def test_text_cap_is_enforced_per_string(s) -> None:
     assert sum(len(t) for t in out) <= 5000  # stops at the first string past the cap
 
 
+@pytest.mark.parametrize(
+    "q",
+    [
+        "Maple Espresso E-20 descaling",
+        "descaled espresso",
+        "Maple Espresso E-20 descale",
+    ],
+)
+def test_word_forms_match(s, data: Path, q: str) -> None:
+    """Live round 2: the model asked for "descaling" and got "Not in your manuals"."""
+    hits = s.search_corpus(q, data)
+    assert hits and hits[0]["title"] == "Maple Espresso E-20", q
+
+
 def test_chat_visitor_must_sign_in(s, data: Path) -> None:
     assert "Sign in" in s.search_manuals(None, actor="visitor", query="descale")
     assert "Maple Espresso" in s.search_manuals(
