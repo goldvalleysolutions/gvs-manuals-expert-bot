@@ -281,11 +281,24 @@ class CMap:
         return "".join(out)
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def no_surrogates(text: str) -> str:
+    """Lone UTF-16 surrogates cannot be UTF-8 encoded (pages and replies would 500)."""
+    return _SURROGATE.sub("\ufffd", text)
+
+
+def _char(cp: int) -> str:
+    return "\ufffd" if 0xD800 <= cp <= 0xDFFF else chr(cp)
+
+
 def _utf16(hexd: bytes) -> str:
     try:
-        return bytes.fromhex(hexd.decode()).decode("utf-16-be", errors="replace")
+        raw = bytes.fromhex(hexd.decode())
     except ValueError:
         return ""
+    return no_surrogates(raw.decode("utf-16-be", errors="replace"))
 
 
 def _blocks(text: bytes, begin: bytes, end: bytes) -> list[bytes]:
@@ -339,7 +352,7 @@ def parse_cmap(text: bytes, budget: Budget | None = None) -> CMap | None:
             put(int(src, 16), _utf16(dst))
     for block in _blocks(text, b"beginbfrange", b"endbfrange"):
         for lo, hi, dst, arr in re.findall(
-            rb"<([0-9A-Fa-f]{1,8})>\s*<([0-9A-Fa-f]{1,8})>\s*(?:<([0-9A-Fa-f]{1,256})>|\[([^\]]{0,65536})\])",
+            rb"<([0-9A-Fa-f]{1,8})>\s*<([0-9A-Fa-f]{1,8})>\s*(?:<([0-9A-Fa-f]{1,256})>|\[([^\[\]]{0,65536})\])",
             block,
         ):
             if not room():
@@ -357,7 +370,7 @@ def parse_cmap(text: bytes, budget: Budget | None = None) -> CMap | None:
                     continue
                 head, cp0 = base[:-1], ord(base[-1])
                 n = min(hi_i - lo_i + 1, 0x10FFFF - cp0 + 1, budget.codes)
-                codes.update((lo_i + k, head + chr(cp0 + k)) for k in range(n))
+                codes.update((lo_i + k, head + _char(cp0 + k)) for k in range(n))
                 budget.codes -= n
     return CMap(width, codes) if codes else None
 
@@ -402,7 +415,7 @@ def _pdf_strings(
     def text_of(raw: bytes) -> str:
         return cmap.decode(raw) if cmap is not None else _plain(raw)
 
-    toks = (m.group(0) for m in _TOK.finditer(content))
+    toks = map(re.Match.group, _TOK.finditer(content))  # no generator frame per token
     for tok in toks:
         if tok == b"(":
             depth, buf = 1, bytearray()
@@ -512,10 +525,10 @@ _REF = rb"(\d{1,10})\s+\d{1,5}\s+R"
 def _font_names(data: bytes, objs: dict[int, bytes]) -> dict[bytes, int]:
     """Resource name (``/F1``) -> font object number, from every ``/Font <<..>>`` dict."""
     names: dict[bytes, int] = {}
-    bodies = [m.group(1) for m in re.finditer(rb"/Font\s*<<([^>]{0,8192})>>", data)]
+    bodies = [m.group(1) for m in re.finditer(rb"/Font\s*<<([^<>]{0,8192})>>", data)]
     for m in re.finditer(rb"/Font\s+" + _REF, data):
         body = objs.get(int(m.group(1)), b"")
-        inner = re.search(rb"<<([^>]{0,8192})>>", body)
+        inner = re.search(rb"<<([^<>]{0,8192})>>", body)
         if inner:
             bodies.append(inner.group(1))
     for body in bodies:
@@ -596,7 +609,7 @@ def pdf_text(data: bytes) -> str:
                 left -= len(t) + 1
         if left <= 0:
             break
-    return "\n".join(texts)[:MAX_TEXT]
+    return no_surrogates("\n".join(texts)[:MAX_TEXT])
 
 
 _PDF_HEADING = re.compile(
@@ -672,7 +685,7 @@ def read_manual(path: Path) -> str:
 def clean(text: str) -> str:
     """Strip HTML comments/tags and instruction-like lines; manual text is data."""
     text = re.sub(r"<!--.*?(-->|$)", " ", text, flags=re.DOTALL)
-    text = re.sub(r"</?[a-zA-Z][^>]*>", " ", text)
+    text = re.sub(r"</?[a-zA-Z][^<>]*>", " ", text)  # [^<>]: linear on "<a<a<a"
     lines = [REMOVED if INJECTION.search(line) else line for line in text.splitlines()]
     return "\n".join(lines)
 

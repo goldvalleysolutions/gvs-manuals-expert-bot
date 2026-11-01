@@ -206,12 +206,35 @@ def test_admin_upload_replaces_demo_manuals(
     expect(msg).to_have_attribute("role", "alert")
     expect(msg).to_have_class(re.compile(r"\berror\b"))
     expect(page.locator("#manual-list")).not_to_contain_text("blank-notes.md")
+    # A PDF with words but one line only (title, 0 sections) is refused too.
+    stream = zlib.compress(
+        b"BT /F1 12 Tf 72 720 Td (Quick reference card for staff) Tj ET"
+    )
+    card = tmp_path / "one-line-card.pdf"
+    card.write_bytes(
+        b"%PDF-1.4\n1 0 obj<</Length "
+        + str(len(stream)).encode()
+        + b"/Filter/FlateDecode>>\nstream\n"
+        + stream
+        + b"\nendstream\nendobj\n%%EOF\n"
+    )
+    page.set_input_files("#manual", str(card))
+    page.locator("#upload").click()
+    page.wait_for_load_state()
+    expect(msg).to_contain_text("one-line-card.pdf: No readable text found in this PDF")
+    expect(msg).to_have_attribute("role", "alert")
+    expect(page.locator("#manual-list")).not_to_contain_text("one-line-card.pdf")
     # Free text in ?msg= is never shown; only known codes map to fixed strings.
     page.goto(ready_bot.base + MANUALS + "?msg=" + urllib.parse.quote("Call 555-EVIL"))
     expect(page.locator("#upload-msg")).to_have_count(0)
     expect(page.locator("body")).not_to_contain_text("555-EVIL")
     first = page.locator("#demo-manuals").count() == 1  # desktop and mobile share a bot
     tag = str(page.viewport_size["width"])
+    # Search hint: espresso example only while the demo set is live.
+    expect(page.locator("#q")).to_have_attribute(
+        "placeholder",
+        "e.g. descale espresso" if first else "e.g. error code or cleaning",
+    )
     md = tmp_path / f"treatment-table-{tag}.md"
     md.write_text(TABLE_MD, encoding="utf-8")
     page.set_input_files("#manual", str(md))
@@ -255,6 +278,9 @@ def test_admin_upload_replaces_demo_manuals(
     )
     page.goto(ready_bot.base + MANUALS)
     expect(page.locator("#demo-manuals")).to_have_count(0)
+    expect(page.locator("#q")).to_have_attribute(
+        "placeholder", "e.g. error code or cleaning"
+    )
     expect(page.locator("#manual-list")).to_contain_text(f"treatment-table-{tag}.md")
     expect(page.locator("#manual-list")).not_to_contain_text("maple-espresso")
     page.goto(

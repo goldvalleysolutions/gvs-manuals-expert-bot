@@ -751,6 +751,51 @@ def test_cmap_surrogate_pair_range_carries(s) -> None:
     assert rng.decode(b"\x00\x01") == "\U0001f7ff\U0001f800"
 
 
+def test_cmap_never_emits_lone_surrogates(s) -> None:
+    """Panel r3: <0000><0005><D7FE> walked into D800..D803 and crashed .encode()."""
+    cmap = s.parse_cmap(
+        b"begincodespacerange <0000> <FFFF> endcodespacerange "
+        b"beginbfrange <0000> <0005> <D7FE> endbfrange "
+        b"beginbfrange <0010> <0011> [<DC00> <0041>] endbfrange "
+        b"beginbfchar <0020> <D800> <0021> <DFFF0042> endbfchar"
+    )
+    out = cmap.decode(bytes.fromhex("0000000100020003000400050010001100200021"))
+    assert out == "\ud7fe\ud7ff" + "\ufffd" * 5 + "A" + "\ufffd" * 2 + "B"
+    assert out.encode("utf-8").decode("utf-8") == out
+    assert not any(0xD800 <= ord(c) <= 0xDFFF for c in out)
+
+
+def test_pdf_text_output_is_utf8_safe(s) -> None:
+    assert s.no_surrogates("a\ud800b\udfffc") == "a\ufffdb\ufffdc"
+    font = (
+        b"1 0 obj << /Type /Font /ToUnicode 2 0 R >> endobj\n"
+        b"2 0 obj << /Length 99 >>\nstream\nbegincodespacerange <00> <FF> endcodespacerange "
+        b"beginbfrange <00> <05> <D7FE> endbfrange\nendstream\nendobj\n"
+        b"3 0 obj << /Resources << /Font << /F1 1 0 R >> >> >> endobj\n"
+        b"4 0 obj << /Length 99 >>\nstream\nBT /F1 12 Tf <000102030405> Tj ET\nendstream\nendobj\n"
+    )
+    text = s.pdf_text(b"%PDF-1.4\n" + font)
+    assert "\ufffd" in text and text.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["font_dict", "bfrange_array", "clean_tags"],
+)
+def test_bounded_class_regexes_are_linear(s, case: str) -> None:
+    """Panel r3: [^>]{0,8192} after "/Font<<" restarted at every "<<" (58 s at 9.8 MB)."""
+    import time
+
+    t0 = time.monotonic()
+    if case == "font_dict":
+        s.pdf_text(b"%PDF-1.4\n" + b"/Font<<" * 1_400_000)
+    elif case == "bfrange_array":
+        s.parse_cmap(b"beginbfrange " + b"<00><01>[" * 60_000 + b" endbfrange")
+    else:
+        s.clean("<a" * 200_000)
+    assert time.monotonic() - t0 < 2.0, case
+
+
 def test_cmap_one_byte_fallback_without_codespacerange(s) -> None:
     cmap = s.parse_cmap(b"beginbfchar <41> <0058> <42> <0059> endbfchar")
     assert cmap.width == 1 and cmap.decode(b"AB") == "XY"
