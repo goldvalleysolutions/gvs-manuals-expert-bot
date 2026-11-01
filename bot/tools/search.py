@@ -12,18 +12,21 @@ coffee-shop manuals (``bot/demo/manuals/``) are no longer searched.
 
 from __future__ import annotations
 
-import bisect
 import logging
 import math
 import os
 import re
-import sys
-import zlib
-from array import array
-from itertools import islice, repeat
 from pathlib import Path
 from typing import Any
 
+from core.pdf import (
+    PdfExtractBusy,
+    PdfExtractError,
+    PdfExtractTimeout,
+    PdfExtractTooLarge,
+    extract_pdf_text,
+    extract_pdf_text_async,
+)
 from core.sdk import tool
 from core.tools.registry import registered
 
@@ -34,16 +37,12 @@ DEFAULT_LIMIT = 5
 MAX_LIMIT = 20
 SUFFIXES = (".md", ".pdf")
 MAX_BYTES = 10 * 1024 * 1024
-MAX_INFLATED = (
-    32 * 1024 * 1024
-)  # total decompressed PDF stream bytes per file (PDF bomb cap)
-MAX_TEXT = 2 * 1024 * 1024  # extracted text kept per manual
+MAX_TEXT = 2 * 1024 * 1024  # .md text kept per manual (core.pdf caps PDFs the same)
 MIN_WORDS = 3  # fewer searchable words than this: treat the PDF as unreadable
 MANUALS_URL = "/r/manuals-expert/"
 POINTER = f"Browse or add manuals: {MANUALS_URL}"
 POINTER_NOTE = f"End your reply with this exact line: {POINTER}"
 UNREADABLE = "No readable text found in this PDF (scanned or unsupported encoding)."
-TOO_BIG = "That PDF expands to more than 32 MB of data; it was not added."
 TOKEN = re.compile(r"[a-z0-9]+")
 STOP = {
     "a",
@@ -245,473 +244,13 @@ def corpus(data_dir: Path) -> tuple[list[Path], bool]:
 # ---- text ----------------------------------------------------------------------------
 
 
-class PdfTooLarge(ValueError):
-    """The PDF's streams inflate past MAX_INFLATED (likely a decompression bomb)."""
+# PDF text comes from core.pdf: a child process with a timeout, rlimits and a
+# concurrency limit (Core PR #41). The bot only turns that text into sections.
 
 
-# Content-stream scanning. ``_TOK`` is searched (not matched) so runs of numbers,
-# whitespace and brackets are skipped in C; only escapes, string openers, names and
-# operators come back to Python. Literal strings are collected with ``_LIT_RUN``
-# (possessive, so no backtracking) jumping from paren to paren, and hex strings with
-# one ``_HEX_END`` search: no per-byte or per-token Python work inside a string.
-_TOK = re.compile(rb"\\[\s\S]|[(<]|/[^\s/<>\[\]()%{}]*|[A-Za-z*'\"]+")
-_LIT_RUN = re.compile(rb"(?:[^\\()]++|\\[\s\S])*+")
-_HEX_END = re.compile(rb"[<>]")
-_NO_PAREN_ESC = re.compile(rb"[^\\()]*\Z")
-MAX_STRING_WORK = 16 * 1024 * 1024  # work units per FILE (see TOKEN_COST, STRING_COST)
-TOKEN_COST = 4  # per token handled in Python (operators, names, strings)
-STRING_COST = 16  # per string, on top of its bytes
-ESCAPE_COST = 16  # work units per backslash escape (each is a Python call)
-
-
-class Work:
-    """Per-file budget for string work, so strings that decode to nothing still stop."""
-
-    def __init__(self, units: int = MAX_STRING_WORK) -> None:
-        self.left = units
-
-
-MAX_STREAMS = 5000
-MAX_CMAP = 1024 * 1024  # CMap bytes parsed per FILE (all ToUnicode maps together)
-MAX_CMAP_CODES = 65536  # CMap codes kept per FILE (all ToUnicode maps together)
-
-
-class Budget:
-    """Per-file CMap budget shared by every ToUnicode map in one PDF."""
-
-    def __init__(self, codes: int = MAX_CMAP_CODES, size: int = MAX_CMAP) -> None:
-        self.codes = codes
-        self.bytes = size
-
-
-class CMap:
-    """A font's ToUnicode map: glyph code bytes -> Unicode text."""
-
-    def __init__(self, width: int, codes: dict[int, str]) -> None:
-        self.width = width
-        self.codes = codes
-        self._table: list[str] | None = None
-
-    def decode(self, raw: bytes, limit: int = MAX_TEXT) -> str:
-        """Decode at most ``limit`` chars; one code can map to several (up to 8).
-
-        Codes are looked up with ``map`` in C, in chunks, so a long string costs no
-        per-code Python work and stops once ``limit`` chars are out."""
-        w = self.width
-        count = min(len(raw) // w, limit)
-        if w == 1:
-            if self._table is None:
-                self._table = [self.codes.get(i, "") for i in range(256)]
-            if count <= 256:  # short string: one join, no chunking
-                return "".join(map(self._table.__getitem__, raw[:count]))[:limit]
-            codes = map(self._table.__getitem__, raw[:count])
-        elif w == 2:
-            nums = array("H", raw[: count * 2])
-            if sys.byteorder == "little":
-                nums.byteswap()
-            codes = map(self.codes.get, nums, repeat(""))
-        else:
-            codes = (
-                self.codes.get(int.from_bytes(raw[i : i + w], "big"), "")
-                for i in range(0, count * w, w)
-            )
-        out: list[str] = []
-        got = taken = 0
-        step = max(256, limit // 8 + 1)
-        while got < limit and taken < count:
-            part = "".join(islice(codes, step))
-            taken += step
-            out.append(part)
-            got += len(part)
-        return "".join(out)[:limit]
-
-
-MAX_DST_HEX = (
-    32  # CMap destination per code: 32 hex digits = 8 UTF-16 units, rest dropped
-)
-_SURROGATE = re.compile("[\ud800-\udfff]")
-
-
-def no_surrogates(text: str) -> str:
-    """Lone UTF-16 surrogates cannot be UTF-8 encoded (pages and replies would 500)."""
-    return _SURROGATE.sub("\ufffd", text)
-
-
-def _char(cp: int) -> str:
-    return "\ufffd" if 0xD800 <= cp <= 0xDFFF else chr(cp)
-
-
-def _utf16(hexd: bytes) -> str:
-    try:
-        raw = bytes.fromhex(hexd[:MAX_DST_HEX].decode())
-    except ValueError:
-        return ""
-    return no_surrogates(raw.decode("utf-16-be", errors="replace"))
-
-
-def _blocks(text: bytes, begin: bytes, end: bytes) -> list[bytes]:
-    """Bodies between begin/end markers, found with bytes.find (linear)."""
-    out, pos = [], 0
-    while True:
-        i = text.find(begin, pos)
-        if i < 0:
-            return out
-        j = text.find(end, i)
-        if j < 0:
-            return out
-        out.append(text[i + len(begin) : j])
-        pos = j + len(end)
-
-
-def parse_cmap(text: bytes, budget: Budget | None = None) -> CMap | None:
-    """bfchar / bfrange entries of a ToUnicode CMap (linear block search, budgeted).
-
-    A bfrange destination is incremented by Unicode code point, so a surrogate-pair
-    destination carries correctly (U+1F5FF + 1 = U+1F600).
-
-    ``budget`` is shared across one file: when its codes or bytes run out, parsing
-    stops and the map keeps what it has (the file may then be refused as unreadable).
-    """
-    budget = budget or Budget()
-    if budget.bytes <= 0 or budget.codes <= 0:
-        return None
-    text = text[: budget.bytes]
-    budget.bytes -= len(text)
-    space = _blocks(text, b"begincodespacerange", b"endcodespacerange")
-    first = re.search(rb"<([0-9A-Fa-f]{1,8})>", space[0]) if space else None
-    if first is None:  # no codespacerange: infer from the first source code
-        first = re.search(rb"begin(?:bfchar|bfrange)\s*<([0-9A-Fa-f]{1,8})>", text)
-    width = max(1, len(first.group(1)) // 2) if first else 1
-    codes: dict[int, str] = {}
-
-    def room() -> bool:
-        return budget.codes > 0
-
-    def put(code: int, value: str) -> None:
-        codes[code] = value
-        budget.codes -= 1
-
-    for block in _blocks(text, b"beginbfchar", b"endbfchar"):
-        for src, dst in re.findall(
-            rb"<([0-9A-Fa-f]{1,8})>\s*<([0-9A-Fa-f]{0,256})>", block
-        ):
-            if not room():
-                break
-            put(int(src, 16), _utf16(dst))
-    for block in _blocks(text, b"beginbfrange", b"endbfrange"):
-        for lo, hi, dst, arr in re.findall(
-            rb"<([0-9A-Fa-f]{1,8})>\s*<([0-9A-Fa-f]{1,8})>\s*(?:<([0-9A-Fa-f]{1,256})>|\[([^\[\]]{0,65536})\])",
-            block,
-        ):
-            if not room():
-                break
-            lo_i = int(lo, 16)
-            hi_i = min(int(hi, 16), lo_i + budget.codes - 1)
-            if arr:
-                for k, d in enumerate(re.findall(rb"<([0-9A-Fa-f]{0,256})>", arr)):
-                    if lo_i + k > hi_i or not room():
-                        break
-                    put(lo_i + k, _utf16(d))
-            else:
-                base = _utf16(dst)
-                if not base:
-                    continue
-                head, cp0 = base[:-1], ord(base[-1])
-                n = min(hi_i - lo_i + 1, 0x10FFFF - cp0 + 1, budget.codes)
-                codes.update((lo_i + k, head + _char(cp0 + k)) for k in range(n))
-                budget.codes -= n
-    return CMap(width, codes) if codes else None
-
-
-def _hex_bytes(raw: bytes) -> bytes | None:
-    if re.search(rb"[^0-9A-Fa-f\s]", raw):
-        return None  # a <<dict>> or junk, not a hex string
-    hexd = re.sub(rb"\s", b"", raw)
-    if len(hexd) % 2:
-        hexd += b"0"
-    return bytes.fromhex(hexd.decode())
-
-
-def _plain(raw: bytes) -> str:
-    if raw.startswith(b"\xfe\xff"):
-        return raw[2:].decode("utf-16-be", errors="replace")
-    return raw.decode("latin-1")
-
-
-def _pdf_hex(raw: bytes) -> str:
-    data = _hex_bytes(raw)
-    return _plain(data) if data is not None else ""
-
-
-def _pdf_strings(
-    content: bytes,
-    limit: int = MAX_TEXT,
-    fonts: dict[bytes, CMap] | None = None,
-    work: Work | None = None,
-) -> list[str]:
-    """Text of each BT..ET block, from (literal) and <hex> strings shown by Tj/TJ/'/".
-
-    ``fonts`` maps resource names (``/F1``) to ToUnicode CMaps; strings drawn in such a
-    font are decoded through it (subset TrueType / Identity-H fonts), else as Latin-1.
-    Stops as soon as ``limit`` chars are collected or ``work`` runs out.
-    """
-    fonts = fonts or {}
-    work = work if work is not None else Work()
-    out: list[str] = []
-    line: list[str] = []
-    pending: list[str] = []
-    in_bt = False
-    used = 0
-    pend_n = 0  # chars in ``pending`` (not yet in ``used``)
-    cmap: CMap | None = None
-    last_name = b""
-    n = len(content)
-    pos = 0
-    search = _TOK.search
-    while pos < n and used + pend_n < limit and work.left > 0:
-        m = search(content, pos)
-        if m is None:
-            break
-        pos = m.end()
-        tok = m.group()
-        work.left -= TOKEN_COST
-        if tok == b"(":
-            start, depth = pos, 1
-            close = content.find(b")", pos)
-            if close >= 0 and _NO_PAREN_ESC.match(content, pos, close):
-                buf, pos, depth = (
-                    content[pos:close],
-                    close + 1,
-                    0,
-                )  # plain (text) string
-            while depth:
-                pos = _LIT_RUN.match(content, pos).end()
-                if pos >= n:
-                    buf = content[start:n]
-                    break
-                c = content[pos]
-                if c == 0x5C:  # lone backslash at the very end
-                    buf, pos = content[start:pos], n
-                    break
-                pos += 1
-                depth += 1 if c == 0x28 else -1
-                if not depth:
-                    buf = content[start : pos - 1]
-                    break
-            room = limit - used - pend_n
-            width = cmap.width if cmap is not None else 2
-            cut = min(len(buf), room * width * 4 + 8)
-            escapes = buf.count(b"\\", 0, cut)  # each one is a Python call in unescape
-            if escapes * ESCAPE_COST > work.left:
-                cut = cut * max(work.left, 0) // (escapes * ESCAPE_COST)
-                escapes = buf.count(b"\\", 0, cut)
-            work.left -= cut + STRING_COST + escapes * ESCAPE_COST
-            if in_bt:
-                seg = buf[:cut] if cut < len(buf) else buf
-                raw = _pdf_unescape_bytes(seg, room * width + 2) if escapes else seg
-                if cmap is not None:
-                    text = cmap.decode(raw[: room * width], room)
-                else:
-                    text = _plain(raw[: room * 2 + 2])[:room]
-                pending.append(text)
-                pend_n += len(text)
-        elif tok == b"<":
-            j = _HEX_END.search(content, pos)
-            end = j.start() if j else n
-            room = limit - used - pend_n
-            width = cmap.width if cmap is not None else 2
-            cut = min(end - pos, room * width * 4 + 8)
-            work.left -= cut + STRING_COST
-            if in_bt and end > pos:
-                raw = _hex_bytes(content[pos : pos + cut])
-                if raw:
-                    if cmap is not None:
-                        text = cmap.decode(raw[: room * width], room)
-                    else:
-                        text = _plain(raw[: room * 2 + 2])[:room]
-                    pending.append(text)
-                    pend_n += len(text)
-            pos = end + 1
-        elif tok[0] == 0x2F:  # /Name
-            last_name = tok
-        elif tok == b"Tf":
-            cmap = fonts.get(last_name)
-        elif not in_bt:
-            in_bt = tok == b"BT"
-            line, pending, pend_n = [], [], 0
-        elif tok == b"ET":
-            if line:  # empty blocks add nothing (pdf_text drops blank strings anyway)
-                out.append("".join(line))
-                used += len(out[-1])
-            in_bt = False
-        elif tok in (b"Tj", b"TJ", b"'", b'"'):
-            if tok in (b"'", b'"'):
-                line.append("\n")
-            line.extend(pending)
-            used += pend_n
-            pending, pend_n = [], 0
-        elif tok in (b"T*", b"Td", b"TD"):
-            line.append("\n")
-    capped = used + pend_n >= limit or work.left <= 0
-    if capped and in_bt and (line or pending):  # stopped mid-block: keep what was shown
-        out.append("".join(line + pending))
-    return out
-
-
-_ESC = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"(": b"(", b")": b")", b"\\": b"\\"}
-
-
-_UNESC_RE = re.compile(rb"\\(?:[0-7]{1,3}|[nrt()\\])?")
-_UNESC = {b"\\" + k: v for k, v in _ESC.items()}
-_UNESC.update(
-    {
-        b"\\" + format(i, "o").zfill(w).encode(): bytes([i & 0xFF])
-        for w in (1, 2, 3)
-        for i in range(8**w)
-    }
-)
-
-
-def _pdf_unescape_bytes(raw: bytes, limit: int | None = None) -> bytes:
-    """Unescape a literal string (``\\n \\r \\t \\( \\) \\\\``, octal; any other backslash
-    is dropped, a trailing lone one kept) in one regex scan, producing at most ``limit``
-    bytes. Each output byte uses at most 4 input bytes, so the input is cut first."""
-    if limit is not None and len(raw) > limit * 4 + 4:
-        raw, end = raw[: limit * 4 + 4], -1
-    else:
-        end = len(raw)
-    get = _UNESC.get
-    res = (
-        bytearray()
-    )  # built in place: memory stays O(output), not one piece per escape
-    last = 0
-    for m in _UNESC_RE.finditer(raw):
-        res += raw[last : m.start()]
-        last = m.end()
-        res += get(m.group()) or (b"\\" if last == end else b"")
-    res += raw[last:]
-    return bytes(res if limit is None else res[:limit])
-
-
-def _pdf_unescape(raw: bytes) -> str:
-    return _pdf_unescape_bytes(raw).decode("latin-1")
-
-
-def _streams(data: bytes):
-    """(offset, raw body) of each stream, found with bytes.find (linear), <= MAX_STREAMS."""
-    pos = 0
-    for _ in range(MAX_STREAMS):
-        i = data.find(b"stream", pos)
-        if i < 0:
-            return
-        start = i + 6
-        if data[start : start + 2] == b"\r\n":
-            start += 2
-        elif data[start : start + 1] in (b"\n", b"\r"):
-            start += 1
-        else:
-            pos = start
-            continue
-        end = data.find(b"endstream", start)
-        if end < 0:
-            return
-        yield i, data[start:end].rstrip(b"\r\n")
-        pos = end + 9
-
-
-_OBJ = re.compile(rb"(\d{1,10})\s+\d{1,5}\s+obj\b")
-_REF = rb"(\d{1,10})\s+\d{1,5}\s+R"
-
-
-def _font_names(data: bytes, objs: dict[int, bytes]) -> dict[bytes, int]:
-    """Resource name (``/F1``) -> font object number, from every ``/Font <<..>>`` dict."""
-    names: dict[bytes, int] = {}
-    bodies = [m.group(1) for m in re.finditer(rb"/Font\s*<<([^<>]{0,8192})>>", data)]
-    for m in re.finditer(rb"/Font\s+" + _REF, data):
-        body = objs.get(int(m.group(1)), b"")
-        inner = re.search(rb"<<([^<>]{0,8192})>>", body)
-        if inner:
-            bodies.append(inner.group(1))
-    for body in bodies:
-        for name, num in re.findall(rb"(/[^\s/<>\[\]()%{}]+)\s+" + _REF, body):
-            names.setdefault(name, int(num))
-    return names
-
-
-_USED_FONT = re.compile(rb"(/[^\s/<>\[\]()%{}]+)\s+[-+]?[\d.]+\s+Tf")
-
-
-def pdf_text(data: bytes) -> str:
-    """Best-effort text from a text PDF (Flate or plain streams, no OCR).
-
-    Fonts with a ToUnicode CMap (LibreOffice/Word subset TrueType, Identity-H) are
-    decoded through it. Only the ToUnicode streams of fonts the page content actually
-    selects (``/F1 10 Tf``) are parsed, under one per-file Budget. Every stream body,
-    compressed or not, counts against MAX_INFLATED (raises PdfTooLarge); streams are
-    capped at MAX_STREAMS and the extracted text at MAX_TEXT characters.
-    """
-    starts = [(m.start(), int(m.group(1))) for m in _OBJ.finditer(data)]
-    objs: dict[int, bytes] = {}
-    for k, (pos, num) in enumerate(starts):  # object dict text (stream data excluded)
-        end = starts[k + 1][0] if k + 1 < len(starts) else len(data)
-        body = data[pos:end]
-        cut = body.find(b"stream")
-        objs[num] = body[: cut if cut >= 0 else 4096][:4096]
-    offsets = [p for p, _ in starts]
-    budget = MAX_INFLATED
-    streams: list[tuple[int, bytes]] = []  # (object number or -1, decoded body)
-    for at, raw in _streams(data):
-        try:
-            inflater = zlib.decompressobj()
-            out = inflater.decompress(raw, budget + 1)
-            if len(out) > budget or inflater.unconsumed_tail:
-                raise PdfTooLarge(TOO_BIG)
-            raw = out
-        except zlib.error:
-            if len(raw) > budget:  # plain streams count too
-                raise PdfTooLarge(TOO_BIG) from None
-        budget -= len(raw)
-        k = bisect.bisect_right(offsets, at) - 1
-        streams.append((starts[k][1] if k >= 0 else -1, raw))
-    # Fonts first: which ToUnicode objects do the selected fonts point at?
-    names = _font_names(data, objs)
-    used: set[bytes] = set()
-    for num, raw in streams:
-        used.update(m.group(1) for m in _USED_FONT.finditer(raw))
-    want: dict[int, list[bytes]] = {}
-    for name in used:
-        font_num = names.get(name)
-        tu = (
-            re.search(rb"/ToUnicode\s+" + _REF, objs.get(font_num, b""))
-            if font_num
-            else None
-        )
-        if tu:
-            want.setdefault(int(tu.group(1)), []).append(name)
-    fonts: dict[bytes, CMap] = {}
-    cmap_budget = Budget()
-    contents: list[bytes] = []
-    for num, raw in streams:
-        if num in want:
-            parsed = parse_cmap(
-                raw, cmap_budget
-            )  # stops (partial/None) when over budget
-            if parsed:
-                for name in want.pop(num):
-                    fonts[name] = parsed
-        elif b"BT" in raw:
-            contents.append(raw)
-    texts: list[str] = []
-    left = MAX_TEXT
-    work = Work()
-    for raw in contents:
-        for t in _pdf_strings(raw, left, fonts, work):
-            if t.strip():
-                texts.append(t)
-                left -= len(t) + 1
-        if left <= 0 or work.left <= 0:
-            break
-    return no_surrogates("\n".join(texts)[:MAX_TEXT])
+def pdf_text(data: bytes, name: str = "") -> str:
+    """Text of a text PDF via core.pdf (blocking). Raises core's PdfExtractError."""
+    return extract_pdf_text(data, name=name)
 
 
 _PDF_HEADING = re.compile(
@@ -745,15 +284,30 @@ def index_chunks(text: str, cleaned: bool = False) -> int:
     return sum(1 for h, b in sections_of(text) if terms(h + " " + b))
 
 
-def check_pdf(data: bytes) -> str:
-    """Empty string when the PDF has readable text, else the message for the uploader."""
+def pdf_unreadable(text: str) -> bool:
+    """No text layer (scanned: core returns ""), too few words, or 0 sections."""
+    return len(terms(text)) < MIN_WORDS or not index_chunks(pdf_markdown(text))
+
+
+async def check_pdf(data: bytes, name: str = "") -> str:
+    """ "" when the PDF has searchable text, else an upload refusal code: the core.pdf
+    error kind (its user-safe message is shown as-is) or "unreadable"."""
     try:
-        text = pdf_text(data)
-    except PdfTooLarge:
-        return TOO_BIG
-    if len(terms(text)) < MIN_WORDS or not index_chunks(pdf_markdown(text)):
-        return UNREADABLE
-    return ""
+        text = await extract_pdf_text_async(data, name=name)
+    except PdfExtractError as err:
+        return pdf_error_code(err)
+    return "unreadable" if pdf_unreadable(text) else ""
+
+
+def pdf_error_code(err: PdfExtractError) -> str:
+    for kind, code in (
+        (PdfExtractTimeout, "pdf_complex"),
+        (PdfExtractTooLarge, "pdf_large"),
+        (PdfExtractBusy, "pdf_busy"),
+    ):
+        if isinstance(err, kind):
+            return code
+    return "pdf_damaged"
 
 
 _CACHE: dict[tuple[str, int, int], str] = {}
@@ -768,9 +322,9 @@ def read_manual(path: Path) -> str:
         return _CACHE[key]
     if path.suffix.lower() == ".pdf":
         try:
-            text = pdf_markdown(pdf_text(path.read_bytes()))
-        except PdfTooLarge:
-            text = ""
+            text = pdf_markdown(pdf_text(path.read_bytes(), name=path.name))
+        except PdfExtractError:
+            text = ""  # logged by core (file name only); not indexed
     else:
         text = path.read_text(encoding="utf-8", errors="replace")[:MAX_TEXT]
     text = clean(text)

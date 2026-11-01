@@ -80,8 +80,11 @@ every result.
 
 PDFs must contain real text: a scanned (image-only) PDF or an unsupported text
 encoding is refused at upload with "No readable text found in this PDF (scanned or
-unsupported encoding)." PDFs that expand past 32 MB of data are refused too. Text PDFs from LibreOffice,
-Word and similar tools (embedded subset fonts with a ToUnicode map) are read. Any
+unsupported encoding)." PDF text comes from Core's `core.pdf` (a separate process
+with a 5 s timeout and memory limits); its refusals are shown as-is, for example
+"Could not read 'x.pdf': it is too large or complex to process. Try a smaller file, or
+split it into parts." Text PDFs from LibreOffice, Word and similar tools (embedded
+subset fonts with a ToUnicode map) are read. Any
 file that would give nothing searchable (0 sections indexed) is refused at upload
 with "<file>: no searchable text found in this file (0 sections indexed), so it was
 not added." A file copied in with `docker cp` that indexes to nothing is skipped and
@@ -195,14 +198,14 @@ All checks: `GVS_E2E_REQUIRED=1 scripts/verify-local.sh`.
 
 ## End-to-end tests (Playwright)
 
-`tests/e2e/` starts the bot on core from source (pinned to gvs-core-bot `9d98a89`) with
+`tests/e2e/` starts the bot on core from source (pinned to gvs-core-bot `a04a736`) with
 uvicorn, a temp `/data` and the stub model, then drives it in Chromium at desktop
 (1280x800) and mobile (390x844) sizes. `verify-local.sh` runs it through
 `.verify-local.env`, and it must pass before merge.
 
 ```bash
 git clone https://github.com/goldvalleysolutions/gvs-core-bot.git ../gvs-core-bot
-git -C ../gvs-core-bot checkout 9d98a89
+git -C ../gvs-core-bot checkout a04a736
 pip install -r ../gvs-core-bot/requirements.txt -r tests/e2e/requirements.txt
 python -m playwright install chromium
 GVS_CORE_DIR=../gvs-core-bot python -m pytest tests/e2e -q

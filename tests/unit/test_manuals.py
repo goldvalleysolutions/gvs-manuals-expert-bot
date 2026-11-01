@@ -3,6 +3,7 @@ signed-in search, /health version. Stub model only; no LLM keys."""
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import re
 import sys
@@ -245,18 +246,14 @@ def _bomb(inflated: int) -> bytes:
     )
 
 
-def test_pdf_bomb_is_capped(s, data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(s, "MAX_INFLATED", 1024 * 1024)
-    bomb = _bomb(8 * 1024 * 1024)  # ~8 KB that inflates to 8 MB
-    assert len(bomb) < 20_000
-    with pytest.raises(s.PdfTooLarge):
-        s.pdf_text(bomb)
-    assert s.check_pdf(bomb) == s.TOO_BIG
+def test_pdf_bomb_is_refused_by_core(s, data: Path) -> None:
+    bomb = _bomb(40 * 1024 * 1024)  # ~40 KB that inflates past core's 32 MB cap
+    assert len(bomb) < 100_000
+    assert asyncio.run(s.check_pdf(bomb, "bomb.pdf")) == "pdf_large"
     d = data / "manuals-expert"
     d.mkdir(parents=True, exist_ok=True)
     (d / "bomb.pdf").write_bytes(bomb)
     assert s.read_manual(d / "bomb.pdf") == ""  # dropped at search time too
-    # Under the cap a normal PDF still parses.
     assert "canola" in s.pdf_text(_pdf(["## Seasoning", "oil (canola)"]))
 
 
@@ -273,27 +270,20 @@ def test_extracted_text_is_cached(
 
 
 def test_unreadable_pdf_is_rejected(s) -> None:
+    """core.pdf returns "" for a scanned PDF (no error): the bot refuses it."""
     scanned = (
         b"%PDF-1.4\n1 0 obj<</Subtype/Image/Filter/DCTDecode>>\nstream\n"
         + bytes(range(256)) * 4
         + b"\nendstream\n"
     )
-    assert s.check_pdf(scanned) == s.UNREADABLE
+    assert s.pdf_text(scanned) == ""
+    assert asyncio.run(s.check_pdf(scanned)) == "unreadable"
     assert (
         s.UNREADABLE
         == "No readable text found in this PDF (scanned or unsupported encoding)."
     )
-    assert (
-        s.check_pdf(_pdf(["# Flat top grill FG-9", "## Seasoning", "Wipe oil on it."]))
-        == ""
-    )
-
-
-def test_pdf_hex_strings_and_crlf_streams(s) -> None:
-    body = b"BT /F1 12 Tf <4465736361 6c65> Tj T* [<77656b6c79>] TJ ET"
-    raw = zlib.compress(body)
-    pdf = b"%PDF-1.4\n1 0 obj<<>>\nstream\r\n" + raw + b"\r\nendstream\n"
-    assert s.pdf_text(pdf).split() == ["Descale", "wekly"]
+    good = _pdf(["# Flat top grill FG-9", "## Seasoning", "Wipe oil on it."])
+    assert asyncio.run(s.check_pdf(good)) == ""
 
 
 def test_heading_and_title_stay_inside_the_fence(s, data: Path) -> None:
@@ -317,31 +307,6 @@ def test_heading_and_title_stay_inside_the_fence(s, data: Path) -> None:
     tags = re.findall(r"<\s*/?\s*manual_excerpt", out, re.IGNORECASE)
     assert tags == ["<manual_excerpt", "</manual_excerpt"], tags
     assert out.rstrip().endswith(s.POINTER)
-
-
-@pytest.mark.parametrize(
-    "evil",
-    [
-        b"BT " + b"[" * 300_000 + b" ET",
-        b"BT " + b"(" * 300_000,
-        b"BT " * 200_000,
-        b"[" * 300_000 + b"] TJ",
-        b"<" * 300_000,
-    ],
-)
-def test_pathological_pdf_content_is_fast(s, evil: bytes) -> None:
-    import time
-
-    t0 = time.monotonic()
-    s._pdf_strings(evil)
-    s.pdf_text(b"%PDF-1.4\n" + (b"stream\n" + evil[:1000]) * 20_000)
-    assert time.monotonic() - t0 < 10.0  # linear: ~0.1 s here; quadratic took >300 s
-
-
-def test_text_cap_is_enforced_per_string(s) -> None:
-    body = b"BT " + (b"(" + b"A" * 5000 + b") Tj ") * 50 + b"ET"
-    out = s._pdf_strings(body, limit=1000)
-    assert sum(len(t) for t in out) <= 5000  # stops at the first string past the cap
 
 
 @pytest.mark.parametrize(
@@ -571,11 +536,13 @@ FIXTURES = REPO / "tests" / "fixtures"
 
 
 def test_libreoffice_pdf_text_is_extracted(s) -> None:
-    text = s.pdf_text((FIXTURES / "gameready-cold-unit.pdf").read_bytes())
+    data = (FIXTURES / "gameready-cold-unit.pdf").read_bytes()
+    text = s.pdf_text(data)
     assert "Game Ready GRPro 2.1 Cold Compression Unit" in text
     assert "Fill the reservoir with cold water" in text
     assert "Raynaud's phenomenon" in text
-    assert s.check_pdf((FIXTURES / "gameready-cold-unit.pdf").read_bytes()) == ""
+    assert "## Section 4: Error E3 (low water)" in s.pdf_markdown(text)
+    assert asyncio.run(s.check_pdf(data)) == ""
 
 
 @pytest.mark.parametrize(
@@ -599,16 +566,6 @@ def test_libreoffice_pdf_is_searchable(s, data: Path, q: str, section) -> None:
     assert hits[0]["title"].startswith("Game Ready GRPro 2.1")
     if section:
         assert hits[0]["section"] == section
-
-
-def test_cmap_bfrange_and_two_byte_codes(s) -> None:
-    cmap = s.parse_cmap(
-        b"begincodespacerange <0000> <FFFF> endcodespacerange "
-        b"2 beginbfchar <0001> <0048> <0002> <0069> endbfchar "
-        b"1 beginbfrange <0010> <0012> <0061> endbfrange"
-    )
-    assert cmap.width == 2
-    assert cmap.decode(bytes.fromhex("000100020010001100120000")) == "Hiabc"
 
 
 def test_zero_chunk_drop_in_is_logged(
@@ -672,241 +629,13 @@ def test_role_declines_off_topic() -> None:
     assert "/r/manuals-expert/" in role
 
 
-# ---- CMap budget (round 2) -------------------------------------------------------------
-
-
-def _many_cmaps(n: int, referenced: bool) -> bytes:
-    """n plain (uncompressed) CMap streams; optionally each wired to a used font."""
-    parts = [b"%PDF-1.4\n"]
-    fonts = b""
-    for i in range(n):
-        num = 1000 + i
-        parts.append(
-            b"%d 0 obj\n<<>>\nstream\nbeginbfrange <0000> <FFFF> <0041> endbfrange\nendstream\nendobj\n"
-            % num
-        )
-        if referenced:
-            parts.append(
-                b"%d 0 obj\n<</Type/Font/ToUnicode %d 0 R>>\nendobj\n" % (5000 + i, num)
-            )
-            fonts += b"/F%d %d 0 R " % (i, 5000 + i)
-    if referenced:
-        parts.append(b"9 0 obj\n<</Font <<" + fonts + b">> >>\nendobj\n")
-        body = b"".join(b"BT /F%d 10 Tf <0001> Tj ET\n" % i for i in range(n))
-        parts.append(b"8 0 obj\n<<>>\nstream\n" + body + b"endstream\nendobj\n")
-    return b"".join(parts)
-
-
-@pytest.mark.parametrize(
-    "n, referenced", [(400, False), (5000, False), (400, True), (2000, True)]
-)
-def test_cmap_amplification_is_bounded(s, n: int, referenced: bool) -> None:
-    import time
-    import tracemalloc
-
-    pdf = _many_cmaps(n, referenced)
-    calls = []
-    real = s.parse_cmap
-    s.parse_cmap = lambda text, budget=None: calls.append(1) or real(text, budget)
-    try:
-        tracemalloc.start()
-        t0 = time.monotonic()
-        s.pdf_text(pdf)
-        s.check_pdf(pdf)
-        took = time.monotonic() - t0
-        peak = tracemalloc.get_traced_memory()[1]
-    finally:
-        tracemalloc.stop()
-        s.parse_cmap = real
-    print(
-        f"n={n} referenced={referenced} size={len(pdf)} took={took:.2f}s peak={peak / 1e6:.1f}MB"
-    )
-    assert took < 2.0, took
-    assert peak < 200e6, peak
-    if not referenced:
-        assert calls == []  # no font points at them: never parsed
-
-
-def test_cmap_budget_is_per_file(s) -> None:
-    b = s.Budget()
-    first = s.parse_cmap(b"beginbfrange <0000> <FFFF> <0041> endbfrange", b)
-    assert len(first.codes) == 65536 and b.codes == 0
-    assert s.parse_cmap(b"beginbfchar <01> <0041> endbfchar", b) is None  # spent
-
-
-def test_cmap_array_destination(s) -> None:
-    cmap = s.parse_cmap(b"beginbfrange <01> <03> [<0048> <0069> <0021>] endbfrange")
-    assert cmap.decode(b"\x01\x02\x03") == "Hi!"
-
-
-def test_cmap_surrogate_pair_range_carries(s) -> None:
-    # U+1F600 = D83D DE00; +1 -> U+1F601 (low surrogate carried, not just bumped bytes)
-    cmap = s.parse_cmap(
-        b"begincodespacerange <0000> <FFFF> endcodespacerange "
-        b"beginbfrange <0001> <0002> <D83DDE00> endbfrange "
-        b"beginbfrange <0010> <0010> <D83DDFFF> endbfrange"
-    )
-    assert cmap.decode(bytes.fromhex("00010002")) == "\U0001f600\U0001f601"
-    rng = s.parse_cmap(b"beginbfrange <00> <01> <D83DDFFF> endbfrange")
-    assert rng.decode(b"\x00\x01") == "\U0001f7ff\U0001f800"
-
-
-def test_cmap_never_emits_lone_surrogates(s) -> None:
-    """Panel r3: <0000><0005><D7FE> walked into D800..D803 and crashed .encode()."""
-    cmap = s.parse_cmap(
-        b"begincodespacerange <0000> <FFFF> endcodespacerange "
-        b"beginbfrange <0000> <0005> <D7FE> endbfrange "
-        b"beginbfrange <0010> <0011> [<DC00> <0041>] endbfrange "
-        b"beginbfchar <0020> <D800> <0021> <DFFF0042> endbfchar"
-    )
-    out = cmap.decode(bytes.fromhex("0000000100020003000400050010001100200021"))
-    assert out == "\ud7fe\ud7ff" + "\ufffd" * 5 + "A" + "\ufffd" * 2 + "B"
-    assert out.encode("utf-8").decode("utf-8") == out
-    assert not any(0xD800 <= ord(c) <= 0xDFFF for c in out)
-
-
-def test_pdf_text_output_is_utf8_safe(s) -> None:
-    assert s.no_surrogates("a\ud800b\udfffc") == "a\ufffdb\ufffdc"
-    font = (
-        b"1 0 obj << /Type /Font /ToUnicode 2 0 R >> endobj\n"
-        b"2 0 obj << /Length 99 >>\nstream\nbegincodespacerange <00> <FF> endcodespacerange "
-        b"beginbfrange <00> <05> <D7FE> endbfrange\nendstream\nendobj\n"
-        b"3 0 obj << /Resources << /Font << /F1 1 0 R >> >> >> endobj\n"
-        b"4 0 obj << /Length 99 >>\nstream\nBT /F1 12 Tf <000102030405> Tj ET\nendstream\nendobj\n"
-    )
-    text = s.pdf_text(b"%PDF-1.4\n" + font)
-    assert "\ufffd" in text and text.encode("utf-8")
-
-
-@pytest.mark.parametrize(
-    "case",
-    ["font_dict", "bfrange_array", "clean_tags"],
-)
-def test_bounded_class_regexes_are_linear(s, case: str) -> None:
-    """Panel r3: [^>]{0,8192} after "/Font<<" restarted at every "<<" (58 s at 9.8 MB)."""
+def test_clean_tag_regex_is_linear(s) -> None:
+    """Panel r3: </?[a-zA-Z][^>]*> restarted at every "<a" (38 s at 400 KB)."""
     import time
 
     t0 = time.monotonic()
-    if case == "font_dict":
-        s.pdf_text(b"%PDF-1.4\n" + b"/Font<<" * 1_400_000)
-    elif case == "bfrange_array":
-        s.parse_cmap(b"beginbfrange " + b"<00><01>[" * 60_000 + b" endbfrange")
-    else:
-        s.clean("<a" * 200_000)
-    assert time.monotonic() - t0 < 2.0, case
-
-
-def _expanding_font_pdf(content: bytes) -> bytes:
-    """Font F1: 1-byte codes, 'A' -> 64 x 'A' (256 hex digits), content Flate-compressed."""
-    cmap = (
-        b"begincodespacerange <00> <FF> endcodespacerange "
-        b"beginbfchar <41> <" + b"0041" * 64 + b"> endbfchar"
-    )
-    z = zlib.compress(content)
-    return (
-        b"%PDF-1.4\n1 0 obj << /Type /Font /ToUnicode 2 0 R >> endobj\n"
-        b"2 0 obj << /Length "
-        + str(len(cmap)).encode()
-        + b" >>\nstream\n"
-        + cmap
-        + b"\nendstream\nendobj\n"
-        b"3 0 obj << /Resources << /Font << /F1 1 0 R >> >> >> endobj\n"
-        b"4 0 obj << /Length " + str(len(z)).encode() + b" /Filter /FlateDecode >>\n"
-        b"stream\n" + z + b"\nendstream\nendobj\n%%EOF\n"
-    )
-
-
-@pytest.mark.parametrize("kind", ["literal_30mb", "hex_15mb"])
-def test_cmap_expansion_is_bounded(s, kind: str) -> None:
-    """Panel r4: 1 byte -> 64 chars built 2 GB strings before the Tj/ET text cap."""
-    import time
-    import tracemalloc
-
-    if kind == "literal_30mb":
-        content = b"BT /F1 12 Tf (" + b"A" * 30_000_000 + b") Tj ET"
-    else:
-        content = b"BT /F1 12 Tf <" + b"41" * 7_500_000 + b"> Tj ET"
-    pdf = _expanding_font_pdf(content)
-    tracemalloc.start()
-    t0 = time.monotonic()
-    try:
-        text = s.pdf_text(pdf)
-        peak = tracemalloc.get_traced_memory()[1]
-    finally:
-        tracemalloc.stop()
-    assert time.monotonic() - t0 < 2.0, kind
-    assert peak < 200 * 1024 * 1024, (kind, peak)
-    assert 0 < len(text) <= s.MAX_TEXT + 1
-
-
-_N = 30_000_000  # ~30 MB inflated content stream
-_CPU_CASES = {
-    "tj_array_literal": b"BT /F1 1 Tf [" + b"(A)" * (_N // 3) + b"] TJ ET",
-    "tj_array_hex": b"BT /F1 1 Tf [" + b"<41>" * (_N // 4) + b"] TJ ET",
-    "many_tj": b"BT /F1 1 Tf " + b"(B) Tj " * (_N // 7) + b"ET",
-    "many_bt": b"/F1 1 Tf " + b"BT (B) Tj ET " * (_N // 13),
-    "octal_escapes": b"BT /F1 1 Tf (" + b"\\101" * (_N // 4) + b") Tj ET",
-    "backslash_runs": b"BT /F1 1 Tf (" + b"\\\\" * (_N // 2) + b") Tj ET",
-    "line_continuations": b"BT /F1 1 Tf (" + b"\\\n" * (_N // 2) + b") Tj ET",
-    "unknown_escapes": b"BT /F1 1 Tf (" + b"\\q" * (_N // 2) + b") Tj ET",
-}
-
-
-@pytest.mark.parametrize("case", sorted(_CPU_CASES))
-def test_text_cap_and_work_budget_stop_cpu(s, case: str) -> None:
-    """Panel r5: after the 2 MiB cap, or when strings map to nothing ("B" is unmapped), every
-    later string was still tokenized and unescaped: 25-95 s per ~30 MB stream."""
-    import time
-
-    pdf = _expanding_font_pdf(_CPU_CASES[case])
-    t0 = time.monotonic()
-    text = s.pdf_text(pdf)
-    took = time.monotonic() - t0
-    assert took < 2.0, (case, round(took, 2))
-    assert len(text) <= s.MAX_TEXT
-
-
-def test_cmap_decode_limit_edges(s) -> None:
-    cmap = s.CMap(1, {0x41: "xy"})
-    assert [cmap.decode(b"AAA", n) for n in (0, 1, 2, 3)] == ["", "x", "xy", "xyx"]
-    assert s._pdf_strings(b"BT (abc) Tj ET", 0) == []
-    assert "".join(s._pdf_strings(b"BT (abc) Tj (def) Tj ET", 1)) == "a"
-
-
-def test_cmap_decode_stops_at_limit(s) -> None:
-    cmap = s.CMap(1, {0x41: "x" * 64})
-    assert cmap.decode(b"A" * 1_000_000, 100) == "x" * 100
-
-
-def test_cmap_destination_capped_at_32_hex_digits(s) -> None:
-    long = b"0041" * 64  # 256 hex digits = 64 chars
-    cmap = s.parse_cmap(
-        b"beginbfchar <41> <" + long + b"> endbfchar "
-        b"beginbfrange <42> <43> <" + long + b"> endbfrange "
-        b"beginbfrange <44> <44> [<" + long + b">] endbfrange"
-    )
-    assert cmap.decode(b"A") == "A" * 8
-    assert cmap.decode(b"B") == "A" * 8 and cmap.decode(b"C") == "A" * 7 + "B"
-    assert cmap.decode(b"D") == "A" * 8
-
-
-def test_cmap_one_byte_fallback_without_codespacerange(s) -> None:
-    cmap = s.parse_cmap(b"beginbfchar <41> <0058> <42> <0059> endbfchar")
-    assert cmap.width == 1 and cmap.decode(b"AB") == "XY"
-
-
-def test_mixed_fonts_with_and_without_tounicode(s) -> None:
-    pdf = (
-        b"%PDF-1.4\n"
-        b"3 0 obj\n<</Type/Font/ToUnicode 4 0 R>>\nendobj\n"
-        b"5 0 obj\n<</Type/Font/Encoding/WinAnsiEncoding>>\nendobj\n"
-        b"6 0 obj\n<</Font <</F1 3 0 R /F2 5 0 R>> >>\nendobj\n"
-        b"4 0 obj\n<<>>\nstream\nbegincodespacerange <00> <FF> endcodespacerange "
-        b"beginbfrange <01> <05> <0063> endbfrange\nendstream\nendobj\n"
-        b"7 0 obj\n<<>>\nstream\nBT /F1 10 Tf <0102030405> Tj /F2 10 Tf ( plain words) Tj ET\n"
-        b"endstream\nendobj\n"
-    )
-    assert s.pdf_text(pdf).strip() == "cdefg plain words"
+    s.clean("<a" * 200_000)
+    assert time.monotonic() - t0 < 2.0
 
 
 def test_check_pdf_words_but_zero_sections_is_refused(s) -> None:
@@ -914,7 +643,35 @@ def test_check_pdf_words_but_zero_sections_is_refused(s) -> None:
     pdf = _pdf(["Quick reference card for staff"])
     assert len(s.terms(s.pdf_text(pdf))) >= s.MIN_WORDS
     assert s.index_chunks(s.pdf_markdown(s.pdf_text(pdf))) == 0
-    assert s.check_pdf(pdf) == s.UNREADABLE
+    assert asyncio.run(s.check_pdf(pdf)) == "unreadable"
+
+
+def test_core_pdf_refusals_are_shown_as_is(
+    client, data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each core.pdf error kind maps to a code whose page text is str(err), verbatim."""
+    from core.pdf import runner
+
+    g = _upload_env(client, monkeypatch, admin=True, csrf_ok=True)
+    msgs = g["MESSAGES"]
+    name = "x.pdf"
+    core_text = {
+        "pdf_complex": runner._too_complex(name),
+        "pdf_busy": str(runner._busy(name)),
+    }
+    with pytest.raises(runner.PdfExtractTooLarge) as exc:
+        runner.extract_pdf_text(_bomb(40 * 1024 * 1024), name=name)
+    core_text["pdf_large"] = str(exc.value)
+    core_text["pdf_damaged"] = (  # core/pdf/runner.py, worker exit EXIT_FAILED
+        f"Could not read '{name}': the file looks damaged or isn't a standard PDF. "
+        "Try saving or exporting it as a PDF again and re-upload it."
+    )
+    for code, text in core_text.items():
+        assert msgs[code][0].format(name=name) == text, code
+    r = _post(client, "bomb.pdf", _bomb(40 * 1024 * 1024))
+    assert "msg=pdf_large" in r.headers["location"] and _saved(data) == []
+    r = _post(client, "scan.pdf", b"%PDF-1.4\n1 0 obj<</Subtype/Image>>\nendobj\n")
+    assert "msg=unreadable" in r.headers["location"] and _saved(data) == []
 
 
 def test_search_hint_only_mentions_espresso_in_demo(
