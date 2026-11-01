@@ -17,7 +17,10 @@ import logging
 import math
 import os
 import re
+import sys
 import zlib
+from array import array
+from itertools import islice, repeat
 from pathlib import Path
 from typing import Any
 
@@ -246,12 +249,28 @@ class PdfTooLarge(ValueError):
     """The PDF's streams inflate past MAX_INFLATED (likely a decompression bomb)."""
 
 
-# One linear pass: every alternative is a plain character class, so no input can make
-# the tokenizer backtrack (no ``BT(.*?)ET`` / ``\[(.*?)\]`` scans). Names (``/F1``) are
-# tokens so ``Tf`` knows the current font.
-_TOK = re.compile(
-    rb"\\[\s\S]|[()<>\[\]]|/[^\s/<>\[\]()%{}]*|[A-Za-z*'\"]+|[^\\()<>\[\]/A-Za-z*'\"]+"
-)
+# Content-stream scanning. ``_TOK`` is searched (not matched) so runs of numbers,
+# whitespace and brackets are skipped in C; only escapes, string openers, names and
+# operators come back to Python. Literal strings are collected with ``_LIT_RUN``
+# (possessive, so no backtracking) jumping from paren to paren, and hex strings with
+# one ``_HEX_END`` search: no per-byte or per-token Python work inside a string.
+_TOK = re.compile(rb"\\[\s\S]|[(<]|/[^\s/<>\[\]()%{}]*|[A-Za-z*'\"]+")
+_LIT_RUN = re.compile(rb"(?:[^\\()]++|\\[\s\S])*+")
+_HEX_END = re.compile(rb"[<>]")
+_NO_PAREN_ESC = re.compile(rb"[^\\()]*\Z")
+MAX_STRING_WORK = 16 * 1024 * 1024  # work units per FILE (see TOKEN_COST, STRING_COST)
+TOKEN_COST = 4  # per token handled in Python (operators, names, strings)
+STRING_COST = 16  # per string, on top of its bytes
+ESCAPE_COST = 16  # work units per backslash escape (each is a Python call)
+
+
+class Work:
+    """Per-file budget for string work, so strings that decode to nothing still stop."""
+
+    def __init__(self, units: int = MAX_STRING_WORK) -> None:
+        self.left = units
+
+
 MAX_STREAMS = 5000
 MAX_CMAP = 1024 * 1024  # CMap bytes parsed per FILE (all ToUnicode maps together)
 MAX_CMAP_CODES = 65536  # CMap codes kept per FILE (all ToUnicode maps together)
@@ -271,19 +290,39 @@ class CMap:
     def __init__(self, width: int, codes: dict[int, str]) -> None:
         self.width = width
         self.codes = codes
+        self._table: list[str] | None = None
 
     def decode(self, raw: bytes, limit: int = MAX_TEXT) -> str:
-        """Decode at most ``limit`` chars; one code can map to several (up to MAX_DST)."""
+        """Decode at most ``limit`` chars; one code can map to several (up to 8).
+
+        Codes are looked up with ``map`` in C, in chunks, so a long string costs no
+        per-code Python work and stops once ``limit`` chars are out."""
         w = self.width
-        out = []
-        n = 0
-        for i in range(0, min(len(raw), limit * w) - w + 1, w):
-            code = int.from_bytes(raw[i : i + w], "big")
-            piece = self.codes.get(code, "")
-            out.append(piece)
-            n += len(piece)
-            if n >= limit:
-                break
+        count = min(len(raw) // w, limit)
+        if w == 1:
+            if self._table is None:
+                self._table = [self.codes.get(i, "") for i in range(256)]
+            if count <= 256:  # short string: one join, no chunking
+                return "".join(map(self._table.__getitem__, raw[:count]))[:limit]
+            codes = map(self._table.__getitem__, raw[:count])
+        elif w == 2:
+            nums = array("H", raw[: count * 2])
+            if sys.byteorder == "little":
+                nums.byteswap()
+            codes = map(self.codes.get, nums, repeat(""))
+        else:
+            codes = (
+                self.codes.get(int.from_bytes(raw[i : i + w], "big"), "")
+                for i in range(0, count * w, w)
+            )
+        out: list[str] = []
+        got = taken = 0
+        step = max(256, limit // 8 + 1)
+        while got < limit and taken < count:
+            part = "".join(islice(codes, step))
+            taken += step
+            out.append(part)
+            got += len(part)
         return "".join(out)[:limit]
 
 
@@ -405,64 +444,95 @@ def _pdf_hex(raw: bytes) -> str:
 
 
 def _pdf_strings(
-    content: bytes, limit: int = MAX_TEXT, fonts: dict[bytes, CMap] | None = None
+    content: bytes,
+    limit: int = MAX_TEXT,
+    fonts: dict[bytes, CMap] | None = None,
+    work: Work | None = None,
 ) -> list[str]:
     """Text of each BT..ET block, from (literal) and <hex> strings shown by Tj/TJ/'/".
 
     ``fonts`` maps resource names (``/F1``) to ToUnicode CMaps; strings drawn in such a
     font are decoded through it (subset TrueType / Identity-H fonts), else as Latin-1.
+    Stops as soon as ``limit`` chars are collected or ``work`` runs out.
     """
     fonts = fonts or {}
+    work = work if work is not None else Work()
     out: list[str] = []
     line: list[str] = []
     pending: list[str] = []
     in_bt = False
     used = 0
+    pend_n = 0  # chars in ``pending`` (not yet in ``used``)
     cmap: CMap | None = None
     last_name = b""
-
-    pend_n = 0  # chars in ``pending`` (not yet in ``used``)
-
-    def left() -> int:
-        return max(limit - used - pend_n, 0)
-
-    def text_of(raw: bytes) -> str:
-        # Decode only what still fits: no full-size string before the Tj/ET caps.
-        room = left()
-        if cmap is not None:
-            return cmap.decode(raw[: room * cmap.width], room)
-        return _plain(raw[: room * 2 + 2])[:room]
-
-    def keep(text: str) -> None:
-        nonlocal pend_n
-        pending.append(text)
-        pend_n += len(text)
-
-    toks = map(re.Match.group, _TOK.finditer(content))  # no generator frame per token
-    for tok in toks:
+    n = len(content)
+    pos = 0
+    search = _TOK.search
+    while pos < n and used + pend_n < limit and work.left > 0:
+        m = search(content, pos)
+        if m is None:
+            break
+        pos = m.end()
+        tok = m.group()
+        work.left -= TOKEN_COST
         if tok == b"(":
-            depth, buf = 1, bytearray()
-            for t in toks:
-                if t == b"(":
-                    depth += 1
-                elif t == b")":
-                    depth -= 1
-                    if not depth:
-                        break
-                buf += t
-            if in_bt:
-                need = left() * (cmap.width if cmap else 2) + 2
-                keep(text_of(_pdf_unescape_bytes(bytes(buf), need)))
-        elif tok == b"<":
-            buf = bytearray()
-            for t in toks:
-                if t in (b">", b"<"):
+            start, depth = pos, 1
+            close = content.find(b")", pos)
+            if close >= 0 and _NO_PAREN_ESC.match(content, pos, close):
+                buf, pos, depth = (
+                    content[pos:close],
+                    close + 1,
+                    0,
+                )  # plain (text) string
+            while depth:
+                pos = _LIT_RUN.match(content, pos).end()
+                if pos >= n:
+                    buf = content[start:n]
                     break
-                buf += t
-            raw = _hex_bytes(bytes(buf)) if in_bt and buf else None
-            if raw:
-                keep(text_of(raw))
-        elif tok.startswith(b"/"):
+                c = content[pos]
+                if c == 0x5C:  # lone backslash at the very end
+                    buf, pos = content[start:pos], n
+                    break
+                pos += 1
+                depth += 1 if c == 0x28 else -1
+                if not depth:
+                    buf = content[start : pos - 1]
+                    break
+            room = limit - used - pend_n
+            width = cmap.width if cmap is not None else 2
+            cut = min(len(buf), room * width * 4 + 8)
+            escapes = buf.count(b"\\", 0, cut)  # each one is a Python call in unescape
+            if escapes * ESCAPE_COST > work.left:
+                cut = cut * max(work.left, 0) // (escapes * ESCAPE_COST)
+                escapes = buf.count(b"\\", 0, cut)
+            work.left -= cut + STRING_COST + escapes * ESCAPE_COST
+            if in_bt:
+                seg = buf[:cut] if cut < len(buf) else buf
+                raw = _pdf_unescape_bytes(seg, room * width + 2) if escapes else seg
+                if cmap is not None:
+                    text = cmap.decode(raw[: room * width], room)
+                else:
+                    text = _plain(raw[: room * 2 + 2])[:room]
+                pending.append(text)
+                pend_n += len(text)
+        elif tok == b"<":
+            j = _HEX_END.search(content, pos)
+            end = j.start() if j else n
+            room = limit - used - pend_n
+            width = cmap.width if cmap is not None else 2
+            cut = min(end - pos, room * width * 4 + 8)
+            work.left -= cut + STRING_COST
+            if in_bt and end > pos:
+                raw = _hex_bytes(content[pos : pos + cut])
+                if raw:
+                    if cmap is not None:
+                        text = cmap.decode(raw[: room * width], room)
+                    else:
+                        text = _plain(raw[: room * 2 + 2])[:room]
+                    pending.append(text)
+                    pend_n += len(text)
+            pos = end + 1
+        elif tok[0] == 0x2F:  # /Name
             last_name = tok
         elif tok == b"Tf":
             cmap = fonts.get(last_name)
@@ -470,56 +540,57 @@ def _pdf_strings(
             in_bt = tok == b"BT"
             line, pending, pend_n = [], [], 0
         elif tok == b"ET":
-            out.append("".join(line))
-            used += len(out[-1])
+            if line:  # empty blocks add nothing (pdf_text drops blank strings anyway)
+                out.append("".join(line))
+                used += len(out[-1])
             in_bt = False
-            if used >= limit:
-                break
         elif tok in (b"Tj", b"TJ", b"'", b'"'):
             if tok in (b"'", b'"'):
                 line.append("\n")
-            for piece in pending:
-                line.append(piece)
-                used += len(piece)
+            line.extend(pending)
+            used += pend_n
             pending, pend_n = [], 0
-            if used >= limit:  # S4: cap inside the per-string loop
-                out.append("".join(line))
-                break
         elif tok in (b"T*", b"Td", b"TD"):
             line.append("\n")
+    capped = used + pend_n >= limit or work.left <= 0
+    if capped and in_bt and (line or pending):  # stopped mid-block: keep what was shown
+        out.append("".join(line + pending))
     return out
 
 
 _ESC = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"(": b"(", b")": b")", b"\\": b"\\"}
 
 
+_UNESC_RE = re.compile(rb"\\(?:[0-7]{1,3}|[nrt()\\])?")
+_UNESC = {b"\\" + k: v for k, v in _ESC.items()}
+_UNESC.update(
+    {
+        b"\\" + format(i, "o").zfill(w).encode(): bytes([i & 0xFF])
+        for w in (1, 2, 3)
+        for i in range(8**w)
+    }
+)
+
+
 def _pdf_unescape_bytes(raw: bytes, limit: int | None = None) -> bytes:
-    """Unescape a literal string; plain runs are copied with bytes.find, and at most
-    ``limit`` output bytes are produced."""
-    res = bytearray()
-    cap = len(raw) if limit is None else limit
-    i, n = 0, len(raw)
-    while i < n and len(res) < cap:
-        j = raw.find(b"\\", i)
-        if j < 0:
-            j = n
-        res += raw[i:j]
-        i = j
-        if i >= n - 1:
-            res += raw[i:]  # a trailing lone backslash is kept as-is
-            break
-        nxt = raw[i + 1 : i + 2]
-        if nxt in _ESC:
-            res += _ESC[nxt]
-            i += 2
-            continue
-        octal = re.match(rb"[0-7]{1,3}", raw[i + 1 : i + 4])
-        if octal:
-            res.append(int(octal.group(0), 8) & 0xFF)
-            i += 1 + len(octal.group(0))
-            continue
-        i += 1
-    return bytes(res[:cap])
+    """Unescape a literal string (``\\n \\r \\t \\( \\) \\\\``, octal; any other backslash
+    is dropped, a trailing lone one kept) in one regex scan, producing at most ``limit``
+    bytes. Each output byte uses at most 4 input bytes, so the input is cut first."""
+    if limit is not None and len(raw) > limit * 4 + 4:
+        raw, end = raw[: limit * 4 + 4], -1
+    else:
+        end = len(raw)
+    get = _UNESC.get
+    res = (
+        bytearray()
+    )  # built in place: memory stays O(output), not one piece per escape
+    last = 0
+    for m in _UNESC_RE.finditer(raw):
+        res += raw[last : m.start()]
+        last = m.end()
+        res += get(m.group()) or (b"\\" if last == end else b"")
+    res += raw[last:]
+    return bytes(res if limit is None else res[:limit])
 
 
 def _pdf_unescape(raw: bytes) -> str:
@@ -632,12 +703,13 @@ def pdf_text(data: bytes) -> str:
             contents.append(raw)
     texts: list[str] = []
     left = MAX_TEXT
+    work = Work()
     for raw in contents:
-        for t in _pdf_strings(raw, left, fonts):
+        for t in _pdf_strings(raw, left, fonts, work):
             if t.strip():
                 texts.append(t)
                 left -= len(t) + 1
-        if left <= 0:
+        if left <= 0 or work.left <= 0:
             break
     return no_surrogates("\n".join(texts)[:MAX_TEXT])
 

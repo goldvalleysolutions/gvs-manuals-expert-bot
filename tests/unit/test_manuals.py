@@ -839,6 +839,40 @@ def test_cmap_expansion_is_bounded(s, kind: str) -> None:
     assert 0 < len(text) <= s.MAX_TEXT + 1
 
 
+_N = 30_000_000  # ~30 MB inflated content stream
+_CPU_CASES = {
+    "tj_array_literal": b"BT /F1 1 Tf [" + b"(A)" * (_N // 3) + b"] TJ ET",
+    "tj_array_hex": b"BT /F1 1 Tf [" + b"<41>" * (_N // 4) + b"] TJ ET",
+    "many_tj": b"BT /F1 1 Tf " + b"(B) Tj " * (_N // 7) + b"ET",
+    "many_bt": b"/F1 1 Tf " + b"BT (B) Tj ET " * (_N // 13),
+    "octal_escapes": b"BT /F1 1 Tf (" + b"\\101" * (_N // 4) + b") Tj ET",
+    "backslash_runs": b"BT /F1 1 Tf (" + b"\\\\" * (_N // 2) + b") Tj ET",
+    "line_continuations": b"BT /F1 1 Tf (" + b"\\\n" * (_N // 2) + b") Tj ET",
+    "unknown_escapes": b"BT /F1 1 Tf (" + b"\\q" * (_N // 2) + b") Tj ET",
+}
+
+
+@pytest.mark.parametrize("case", sorted(_CPU_CASES))
+def test_text_cap_and_work_budget_stop_cpu(s, case: str) -> None:
+    """Panel r5: after the 2 MiB cap, or when strings map to nothing ("B" is unmapped), every
+    later string was still tokenized and unescaped: 25-95 s per ~30 MB stream."""
+    import time
+
+    pdf = _expanding_font_pdf(_CPU_CASES[case])
+    t0 = time.monotonic()
+    text = s.pdf_text(pdf)
+    took = time.monotonic() - t0
+    assert took < 2.0, (case, round(took, 2))
+    assert len(text) <= s.MAX_TEXT
+
+
+def test_cmap_decode_limit_edges(s) -> None:
+    cmap = s.CMap(1, {0x41: "xy"})
+    assert [cmap.decode(b"AAA", n) for n in (0, 1, 2, 3)] == ["", "x", "xy", "xyx"]
+    assert s._pdf_strings(b"BT (abc) Tj ET", 0) == []
+    assert "".join(s._pdf_strings(b"BT (abc) Tj (def) Tj ET", 1)) == "a"
+
+
 def test_cmap_decode_stops_at_limit(s) -> None:
     cmap = s.CMap(1, {0x41: "x" * 64})
     assert cmap.decode(b"A" * 1_000_000, 100) == "x" * 100
