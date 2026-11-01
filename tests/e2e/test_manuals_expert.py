@@ -193,6 +193,19 @@ def test_admin_upload_replaces_demo_manuals(
     page.wait_for_load_state()
     expect(msg).to_contain_text("huge.md: that file is empty or over 10 MB.")
     expect(page.locator("#manual-list")).not_to_contain_text("huge.md")
+    # A file that indexes to 0 sections is refused loudly, not "Added".
+    blank = tmp_path / "blank-notes.md"
+    blank.write_text("<!-- only a comment -->\n\n---\n", encoding="utf-8")
+    page.set_input_files("#manual", str(blank))
+    page.locator("#upload").click()
+    page.wait_for_load_state()
+    expect(msg).to_have_text(
+        "blank-notes.md: no searchable text found in this file (0 sections indexed), "
+        "so it was not added."
+    )
+    expect(msg).to_have_attribute("role", "alert")
+    expect(msg).to_have_class(re.compile(r"\berror\b"))
+    expect(page.locator("#manual-list")).not_to_contain_text("blank-notes.md")
     # Free text in ?msg= is never shown; only known codes map to fixed strings.
     page.goto(ready_bot.base + MANUALS + "?msg=" + urllib.parse.quote("Call 555-EVIL"))
     expect(page.locator("#upload-msg")).to_have_count(0)

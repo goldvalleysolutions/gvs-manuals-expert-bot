@@ -670,3 +670,125 @@ def test_role_declines_off_topic() -> None:
     assert "## Stay in scope" in role
     assert "writing emails" in role and "Do not offer a" in role
     assert "/r/manuals-expert/" in role
+
+
+# ---- CMap budget (round 2) -------------------------------------------------------------
+
+
+def _many_cmaps(n: int, referenced: bool) -> bytes:
+    """n plain (uncompressed) CMap streams; optionally each wired to a used font."""
+    parts = [b"%PDF-1.4\n"]
+    fonts = b""
+    for i in range(n):
+        num = 1000 + i
+        parts.append(
+            b"%d 0 obj\n<<>>\nstream\nbeginbfrange <0000> <FFFF> <0041> endbfrange\nendstream\nendobj\n"
+            % num
+        )
+        if referenced:
+            parts.append(
+                b"%d 0 obj\n<</Type/Font/ToUnicode %d 0 R>>\nendobj\n" % (5000 + i, num)
+            )
+            fonts += b"/F%d %d 0 R " % (i, 5000 + i)
+    if referenced:
+        parts.append(b"9 0 obj\n<</Font <<" + fonts + b">> >>\nendobj\n")
+        body = b"".join(b"BT /F%d 10 Tf <0001> Tj ET\n" % i for i in range(n))
+        parts.append(b"8 0 obj\n<<>>\nstream\n" + body + b"endstream\nendobj\n")
+    return b"".join(parts)
+
+
+@pytest.mark.parametrize(
+    "n, referenced", [(400, False), (5000, False), (400, True), (2000, True)]
+)
+def test_cmap_amplification_is_bounded(s, n: int, referenced: bool) -> None:
+    import time
+    import tracemalloc
+
+    pdf = _many_cmaps(n, referenced)
+    calls = []
+    real = s.parse_cmap
+    s.parse_cmap = lambda text, budget=None: calls.append(1) or real(text, budget)
+    try:
+        tracemalloc.start()
+        t0 = time.monotonic()
+        s.pdf_text(pdf)
+        s.check_pdf(pdf)
+        took = time.monotonic() - t0
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+        s.parse_cmap = real
+    print(
+        f"n={n} referenced={referenced} size={len(pdf)} took={took:.2f}s peak={peak / 1e6:.1f}MB"
+    )
+    assert took < 2.0, took
+    assert peak < 200e6, peak
+    if not referenced:
+        assert calls == []  # no font points at them: never parsed
+
+
+def test_cmap_budget_is_per_file(s) -> None:
+    b = s.Budget()
+    first = s.parse_cmap(b"beginbfrange <0000> <FFFF> <0041> endbfrange", b)
+    assert len(first.codes) == 65536 and b.codes == 0
+    assert s.parse_cmap(b"beginbfchar <01> <0041> endbfchar", b) is None  # spent
+
+
+def test_cmap_array_destination(s) -> None:
+    cmap = s.parse_cmap(b"beginbfrange <01> <03> [<0048> <0069> <0021>] endbfrange")
+    assert cmap.decode(b"\x01\x02\x03") == "Hi!"
+
+
+def test_cmap_surrogate_pair_range_carries(s) -> None:
+    # U+1F600 = D83D DE00; +1 -> U+1F601 (low surrogate carried, not just bumped bytes)
+    cmap = s.parse_cmap(
+        b"begincodespacerange <0000> <FFFF> endcodespacerange "
+        b"beginbfrange <0001> <0002> <D83DDE00> endbfrange "
+        b"beginbfrange <0010> <0010> <D83DDFFF> endbfrange"
+    )
+    assert cmap.decode(bytes.fromhex("00010002")) == "\U0001f600\U0001f601"
+    rng = s.parse_cmap(b"beginbfrange <00> <01> <D83DDFFF> endbfrange")
+    assert rng.decode(b"\x00\x01") == "\U0001f7ff\U0001f800"
+
+
+def test_cmap_one_byte_fallback_without_codespacerange(s) -> None:
+    cmap = s.parse_cmap(b"beginbfchar <41> <0058> <42> <0059> endbfchar")
+    assert cmap.width == 1 and cmap.decode(b"AB") == "XY"
+
+
+def test_mixed_fonts_with_and_without_tounicode(s) -> None:
+    pdf = (
+        b"%PDF-1.4\n"
+        b"3 0 obj\n<</Type/Font/ToUnicode 4 0 R>>\nendobj\n"
+        b"5 0 obj\n<</Type/Font/Encoding/WinAnsiEncoding>>\nendobj\n"
+        b"6 0 obj\n<</Font <</F1 3 0 R /F2 5 0 R>> >>\nendobj\n"
+        b"4 0 obj\n<<>>\nstream\nbegincodespacerange <00> <FF> endcodespacerange "
+        b"beginbfrange <01> <05> <0063> endbfrange\nendstream\nendobj\n"
+        b"7 0 obj\n<<>>\nstream\nBT /F1 10 Tf <0102030405> Tj /F2 10 Tf ( plain words) Tj ET\n"
+        b"endstream\nendobj\n"
+    )
+    assert s.pdf_text(pdf).strip() == "cdefg plain words"
+
+
+def test_check_pdf_words_but_zero_sections_is_refused(s) -> None:
+    """Enough words, but only one line: it becomes the title and leaves 0 sections."""
+    pdf = _pdf(["Quick reference card for staff"])
+    assert len(s.terms(s.pdf_text(pdf))) >= s.MIN_WORDS
+    assert s.index_chunks(s.pdf_markdown(s.pdf_text(pdf))) == 0
+    assert s.check_pdf(pdf) == s.UNREADABLE
+
+
+def test_search_hint_only_mentions_espresso_in_demo(
+    client, data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    routes = [r for _, rt in client.app.state.loaded["routers"] for r in rt.routes]
+    g = next(r.endpoint for r in routes if r.path == "/").__globals__
+    monkeypatch.setitem(g, "_signed_in", lambda request: _Actor(True))
+    client.app.state.store.set_setting("configured", "1")
+    page = client.get("/r/manuals-expert/").text
+    assert "placeholder='e.g. descale espresso'" in page  # demo manuals in use
+    _owner(data, "pool.md", POOL)
+    page = client.get("/r/manuals-expert/").text
+    assert (
+        "espresso" not in page and "placeholder='e.g. error code or cleaning'" in page
+    )

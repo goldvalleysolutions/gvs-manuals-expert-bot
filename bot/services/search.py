@@ -127,6 +127,8 @@ def manuals_page(
             "<p id=demo-manuals><strong>Demo manuals</strong>: these coffee-shop manuals "
             "are examples. Add your own and they drop out of results.</p>"
         )
+    # The espresso example only fits the bundled demo manuals.
+    hint = "e.g. descale espresso" if is_demo else "e.g. error code or cleaning"
     if msg in MESSAGES:
         text, is_error = MESSAGES[msg]
         shown = text.format(name=safe_name(name) or "File")
@@ -141,7 +143,7 @@ def manuals_page(
     bits.append(
         f"<form method=get action={BASE} class=manual-search>"
         "<label for=q>Ask your manuals</label>"
-        f"<input id=q name=q value='{esc(q)}' placeholder='e.g. descale espresso'>"
+        f"<input id=q name=q value='{esc(q)}' placeholder='{hint}'>"
         "<button>Search</button></form>"
     )
     if q:

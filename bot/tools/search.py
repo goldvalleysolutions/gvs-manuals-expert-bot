@@ -35,7 +35,6 @@ MAX_INFLATED = (
     32 * 1024 * 1024
 )  # total decompressed PDF stream bytes per file (PDF bomb cap)
 MAX_TEXT = 2 * 1024 * 1024  # extracted text kept per manual
-MIN_TEXT = 20  # kept for compatibility
 MIN_WORDS = 3  # fewer searchable words than this: treat the PDF as unreadable
 MANUALS_URL = "/r/manuals-expert/"
 POINTER = f"Browse or add manuals: {MANUALS_URL}"
@@ -254,8 +253,16 @@ _TOK = re.compile(
     rb"\\[\s\S]|[()<>\[\]]|/[^\s/<>\[\]()%{}]*|[A-Za-z*'\"]+|[^\\()<>\[\]/A-Za-z*'\"]+"
 )
 MAX_STREAMS = 5000
-MAX_CMAP = 1024 * 1024  # bytes of one ToUnicode CMap we parse
-MAX_CMAP_CODES = 65536  # codes kept per CMap
+MAX_CMAP = 1024 * 1024  # CMap bytes parsed per FILE (all ToUnicode maps together)
+MAX_CMAP_CODES = 65536  # CMap codes kept per FILE (all ToUnicode maps together)
+
+
+class Budget:
+    """Per-file CMap budget shared by every ToUnicode map in one PDF."""
+
+    def __init__(self, codes: int = MAX_CMAP_CODES, size: int = MAX_CMAP) -> None:
+        self.codes = codes
+        self.bytes = size
 
 
 class CMap:
@@ -295,41 +302,63 @@ def _blocks(text: bytes, begin: bytes, end: bytes) -> list[bytes]:
         pos = j + len(end)
 
 
-def parse_cmap(text: bytes) -> CMap | None:
-    """bfchar / bfrange entries of a ToUnicode CMap (bounded regexes, capped size)."""
-    text = text[:MAX_CMAP]
-    widths = re.findall(
-        rb"<([0-9A-Fa-f]+)>\s*<[0-9A-Fa-f]+>", text.split(b"endcodespacerange")[0]
-    )
-    width = max(1, len(widths[0]) // 2) if widths else 1
+def parse_cmap(text: bytes, budget: Budget | None = None) -> CMap | None:
+    """bfchar / bfrange entries of a ToUnicode CMap (linear block search, budgeted).
+
+    A bfrange destination is incremented by Unicode code point, so a surrogate-pair
+    destination carries correctly (U+1F5FF + 1 = U+1F600).
+
+    ``budget`` is shared across one file: when its codes or bytes run out, parsing
+    stops and the map keeps what it has (the file may then be refused as unreadable).
+    """
+    budget = budget or Budget()
+    if budget.bytes <= 0 or budget.codes <= 0:
+        return None
+    text = text[: budget.bytes]
+    budget.bytes -= len(text)
+    space = _blocks(text, b"begincodespacerange", b"endcodespacerange")
+    first = re.search(rb"<([0-9A-Fa-f]{1,8})>", space[0]) if space else None
+    if first is None:  # no codespacerange: infer from the first source code
+        first = re.search(rb"begin(?:bfchar|bfrange)\s*<([0-9A-Fa-f]{1,8})>", text)
+    width = max(1, len(first.group(1)) // 2) if first else 1
     codes: dict[int, str] = {}
+
+    def room() -> bool:
+        return budget.codes > 0
+
+    def put(code: int, value: str) -> None:
+        codes[code] = value
+        budget.codes -= 1
+
     for block in _blocks(text, b"beginbfchar", b"endbfchar"):
         for src, dst in re.findall(
             rb"<([0-9A-Fa-f]{1,8})>\s*<([0-9A-Fa-f]{0,256})>", block
         ):
-            if len(codes) < MAX_CMAP_CODES:
-                codes[int(src, 16)] = _utf16(dst)
+            if not room():
+                break
+            put(int(src, 16), _utf16(dst))
     for block in _blocks(text, b"beginbfrange", b"endbfrange"):
         for lo, hi, dst, arr in re.findall(
             rb"<([0-9A-Fa-f]{1,8})>\s*<([0-9A-Fa-f]{1,8})>\s*(?:<([0-9A-Fa-f]{1,256})>|\[([^\]]{0,65536})\])",
             block,
         ):
-            lo_i, hi_i = int(lo, 16), min(int(hi, 16), int(lo, 16) + 65535)
+            if not room():
+                break
+            lo_i = int(lo, 16)
+            hi_i = min(int(hi, 16), lo_i + budget.codes - 1)
             if arr:
                 for k, d in enumerate(re.findall(rb"<([0-9A-Fa-f]{0,256})>", arr)):
-                    if lo_i + k > hi_i or len(codes) >= MAX_CMAP_CODES:
+                    if lo_i + k > hi_i or not room():
                         break
-                    codes[lo_i + k] = _utf16(d)
+                    put(lo_i + k, _utf16(d))
             else:
-                base = bytes.fromhex(dst.decode()) if len(dst) % 2 == 0 else b""
-                if len(base) < 2:
+                base = _utf16(dst)
+                if not base:
                     continue
-                head, last = base[:-2], int.from_bytes(base[-2:], "big")
-                for k in range(hi_i - lo_i + 1):
-                    if len(codes) >= MAX_CMAP_CODES:
-                        break
-                    ch = head + ((last + k) & 0xFFFF).to_bytes(2, "big")
-                    codes[lo_i + k] = ch.decode("utf-16-be", errors="replace")
+                head, cp0 = base[:-1], ord(base[-1])
+                n = min(hi_i - lo_i + 1, 0x10FFFF - cp0 + 1, budget.codes)
+                codes.update((lo_i + k, head + chr(cp0 + k)) for k in range(n))
+                budget.codes -= n
     return CMap(width, codes) if codes else None
 
 
@@ -495,12 +524,17 @@ def _font_names(data: bytes, objs: dict[int, bytes]) -> dict[bytes, int]:
     return names
 
 
+_USED_FONT = re.compile(rb"(/[^\s/<>\[\]()%{}]+)\s+[-+]?[\d.]+\s+Tf")
+
+
 def pdf_text(data: bytes) -> str:
     """Best-effort text from a text PDF (Flate or plain streams, no OCR).
 
     Fonts with a ToUnicode CMap (LibreOffice/Word subset TrueType, Identity-H) are
-    decoded through it. Inflation is capped at MAX_INFLATED bytes per file (raises
-    PdfTooLarge), streams at MAX_STREAMS and the extracted text at MAX_TEXT characters.
+    decoded through it. Only the ToUnicode streams of fonts the page content actually
+    selects (``/F1 10 Tf``) are parsed, under one per-file Budget. Every stream body,
+    compressed or not, counts against MAX_INFLATED (raises PdfTooLarge); streams are
+    capped at MAX_STREAMS and the extracted text at MAX_TEXT characters.
     """
     starts = [(m.start(), int(m.group(1))) for m in _OBJ.finditer(data)]
     objs: dict[int, bytes] = {}
@@ -511,34 +545,48 @@ def pdf_text(data: bytes) -> str:
         objs[num] = body[: cut if cut >= 0 else 4096][:4096]
     offsets = [p for p, _ in starts]
     budget = MAX_INFLATED
-    contents: list[bytes] = []
-    cmaps: dict[int, CMap] = {}
+    streams: list[tuple[int, bytes]] = []  # (object number or -1, decoded body)
     for at, raw in _streams(data):
         try:
             inflater = zlib.decompressobj()
             out = inflater.decompress(raw, budget + 1)
             if len(out) > budget or inflater.unconsumed_tail:
                 raise PdfTooLarge(TOO_BIG)
-            budget -= len(out)
             raw = out
         except zlib.error:
-            pass
-        if (
-            b"begincmap" in raw[:4096]
-            or b"beginbfchar" in raw
-            or b"beginbfrange" in raw
-        ):
-            k = bisect.bisect_right(offsets, at) - 1
-            parsed = parse_cmap(raw)
-            if k >= 0 and parsed:
-                cmaps[starts[k][1]] = parsed
-        else:
-            contents.append(raw)
+            if len(raw) > budget:  # plain streams count too
+                raise PdfTooLarge(TOO_BIG) from None
+        budget -= len(raw)
+        k = bisect.bisect_right(offsets, at) - 1
+        streams.append((starts[k][1] if k >= 0 else -1, raw))
+    # Fonts first: which ToUnicode objects do the selected fonts point at?
+    names = _font_names(data, objs)
+    used: set[bytes] = set()
+    for num, raw in streams:
+        used.update(m.group(1) for m in _USED_FONT.finditer(raw))
+    want: dict[int, list[bytes]] = {}
+    for name in used:
+        font_num = names.get(name)
+        tu = (
+            re.search(rb"/ToUnicode\s+" + _REF, objs.get(font_num, b""))
+            if font_num
+            else None
+        )
+        if tu:
+            want.setdefault(int(tu.group(1)), []).append(name)
     fonts: dict[bytes, CMap] = {}
-    for name, font_num in _font_names(data, objs).items():
-        tu = re.search(rb"/ToUnicode\s+" + _REF, objs.get(font_num, b""))
-        if tu and int(tu.group(1)) in cmaps:
-            fonts[name] = cmaps[int(tu.group(1))]
+    cmap_budget = Budget()
+    contents: list[bytes] = []
+    for num, raw in streams:
+        if num in want:
+            parsed = parse_cmap(
+                raw, cmap_budget
+            )  # stops (partial/None) when over budget
+            if parsed:
+                for name in want.pop(num):
+                    fonts[name] = parsed
+        elif b"BT" in raw:
+            contents.append(raw)
     texts: list[str] = []
     left = MAX_TEXT
     for raw in contents:
