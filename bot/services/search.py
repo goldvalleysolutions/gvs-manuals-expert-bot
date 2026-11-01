@@ -46,8 +46,14 @@ def _signed_in(request: Request) -> Any:
 
 
 def _to_login(request: Request) -> Response:
+    """Logged out: say why before sending them to sign in (Core's /login has no hint hook)."""
     nxt = request.url.path + (f"?{request.url.query}" if request.url.query else "")
-    return RedirectResponse("/login?" + urlencode({"next": nxt}), status_code=303)
+    href = "/login?" + urlencode({"next": nxt})
+    body = (
+        "<h1>Manuals</h1><p id=signin-hint>Sign in to search your manuals.</p>"
+        f"<p><a class=button id=signin href='{esc(href)}'>Sign in</a></p>"
+    )
+    return page("Manuals", body, bot=bot_name(request), nav="<a href='/'>Chat</a>")
 
 
 @router.get("/search")
@@ -58,7 +64,9 @@ def search(
     limit: int = Query(default=5, ge=1, le=20),
 ) -> Response:
     if _signed_in(request) is None:
-        return JSONResponse({"error": "Sign in to search the manuals."}, status_code=401)
+        return JSONResponse(
+            {"error": "Sign in to search the manuals."}, status_code=401
+        )
     return JSONResponse(_search.run_search(request.app.state.store, q, limit))
 
 
@@ -109,13 +117,15 @@ def manuals_page(request: Request, q: str = "", msg: str = "") -> Response:
             )
             bits.append(f"<ol id=results>{items}</ol>")
         else:
-            bits.append(f"<p id=results>Not in your manuals: nothing matched {esc(q)!s}.</p>")
+            bits.append(
+                f"<p id=results>Not in your manuals: nothing matched {esc(q)!s}.</p>"
+            )
     names = "".join(f"<li>{esc(p.name)}</li>" for p in files)
     label = "Demo manuals in use" if is_demo else "Your manuals"
     bits.append(f"<h2>{label}</h2><ul id=manual-list>{names}</ul>")
     if actor.is_admin:
         bits.append(
-            f"<h2>Add a manual</h2><form method=post action={BASE}upload "
+            f"<h2 id=add-manual>Add a manual</h2><form method=post action={BASE}upload "
             f"enctype=multipart/form-data id=upload-form>{csrf.field(request)}"
             "<label for=manual>Markdown (.md) or PDF (.pdf), up to 10 MB</label>"
             "<input type=file id=manual name=manual accept='.md,.pdf' required>"
@@ -137,10 +147,14 @@ async def upload(request: Request) -> Response:
     if actor is None:
         return JSONResponse({"error": "Sign in to add manuals."}, status_code=401)
     if not actor.is_admin:
-        return JSONResponse({"error": "Only the bot admin can add manuals."}, status_code=403)
+        return JSONResponse(
+            {"error": "Only the bot admin can add manuals."}, status_code=403
+        )
     form = await request.form()
     if not csrf.valid(request, {"csrf": str(form.get("csrf") or "")}):
-        return JSONResponse({"error": "Form expired; reload and try again."}, status_code=403)
+        return JSONResponse(
+            {"error": "Form expired; reload and try again."}, status_code=403
+        )
     item = form.get("manual")
     name = safe_name(getattr(item, "filename", "") or "")
     if item is None or not hasattr(item, "read") or not name.endswith(_search.SUFFIXES):
@@ -150,9 +164,15 @@ async def upload(request: Request) -> Response:
         return _back("That file is empty or over 10 MB.")
     if name.endswith(".pdf") and not data.startswith(b"%PDF"):
         return _back("That file is not a PDF.")
+    if name.endswith(".pdf"):
+        problem = _search.check_pdf(data)
+        if problem:
+            return _back(problem)
     dest = _search.ensure_store(Path(request.app.state.store.data_dir)) / name
     dest.write_bytes(data)
-    request.app.state.store.log(actor.name, "manuals.upload", f"file={name}", source="web")
+    request.app.state.store.log(
+        actor.name, "manuals.upload", f"file={name}", source="web"
+    )
     return _back(f"Added {name}. Demo manuals are now out of results.")
 
 

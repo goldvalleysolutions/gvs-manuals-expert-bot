@@ -15,6 +15,7 @@ tools: tools/
 services: services/
 connectors: {}
 wizard: []
+admin_panels: [admin/manuals.yaml]
 theme: theme.yaml
 demo: demo/scenario.yaml
 memory: { history_turns: 20, facts: true, retention_days: 30 }

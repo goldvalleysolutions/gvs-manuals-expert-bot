@@ -15,7 +15,9 @@ docker run -d --name manuals-expert -p 8085:8080 -v manuals-expert-data:/data go
 ```
 
 No clone, no build, no compose, no login to any registry. (Port 8085 on your machine
-is just an example; change the left side of `-p` if it is taken.)
+is just an example.) **If port 8085 is taken** (`port is already allocated`), run
+`docker rm manuals-expert` and repeat with another left side, e.g. `-p 8095:8080`, then
+use that port in the links below.
 
 Step 2: open <http://localhost:8085>. Every page redirects to **`/setup`** until you
 finish it: create the bot-admin password, choose who can use the bot, pick the AI
@@ -38,7 +40,8 @@ Bot Core, so you do not need to know model names.
 
 Searching the manuals always needs an account, even when chat is open to "Anyone":
 the bot admin, or a user you add under **Admin > Users**. Logged out, the search
-endpoint answers `401` and the Manuals page sends you to `/login`. There is no public
+endpoint answers `401` and the Manuals page says "Sign in to search your manuals."
+with a link to `/login`. There is no public
 search endpoint.
 
 ### Load your manuals (.md or .pdf)
@@ -46,6 +49,9 @@ search endpoint.
 As soon as you add one manual of your own, the demo coffee-shop manuals drop out of
 every result.
 
+- **Find it:** the Manuals page is <http://localhost:8085/r/manuals-expert/>. Chat
+  answers end with a "Browse or add manuals" link, and **Admin > Settings** shows a
+  Manuals pointer.
 - **Upload in the browser:** sign in as bot admin and open
   <http://localhost:8085/r/manuals-expert/> > **Add a manual**. Markdown (`.md`) or text PDF
   (`.pdf`), up to 10 MB each.
@@ -58,9 +64,15 @@ every result.
   Search picks them up on the next question; no restart needed. They live in the
   `manuals-expert-data` volume with everything else.
 
-PDFs must contain real text (scanned image-only PDFs are not read yet). Manual text
-is treated as untrusted data: HTML comments and instruction-like lines are removed,
-and excerpts reach the model fenced as quoted reference text, never as instructions.
+PDFs must contain real text: a scanned (image-only) PDF or an unsupported text
+encoding is refused at upload with "No readable text found in this PDF (scanned or
+unsupported encoding)." PDFs that expand past 32 MB of data are refused too.
+
+Manual text is treated as **untrusted reference data**. Excerpts reach the model
+fenced as quoted reference text, never as instructions, and the role tells it never
+to follow directions written inside a manual. A best-effort filter also strips HTML
+and blanks some instruction-like lines, but it will not catch every phrasing, so do
+not rely on it alone; only add manuals you trust.
 
 ### Try it
 

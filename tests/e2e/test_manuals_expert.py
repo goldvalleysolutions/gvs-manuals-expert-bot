@@ -2,23 +2,28 @@
 page with the demo-mode label, 401 for logged-out search, upload, MCP.
 
 Search has no public endpoint: logged out, ``/r/manuals-expert/search`` is 401 and the
-manuals page sends browsers to /login, under either access policy.
+manuals page asks browsers to sign in (bot hint page under Anyone, Core's /login
+redirect under Signed-in users only).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.parse
 import urllib.request
+import zlib
 from pathlib import Path
 
+import pytest
 from playwright.sync_api import Page, expect
 from steps_web import mcp_call, mcp_list
 from ui import (
     ADMIN_PASSWORD,
     USER,
     USER_PASSWORD,
+    admin_login,
     admin_web,
     chat,
     mcp_initialize,
@@ -43,7 +48,8 @@ Wipe the vinyl with mild soap. Do not use alcohol wipes on the upholstery.
 def _status(url: str) -> int:
     try:
         return urllib.request.urlopen(
-            urllib.request.Request(url, headers={"Accept": "application/json"}), timeout=10
+            urllib.request.Request(url, headers={"Accept": "application/json"}),
+            timeout=10,
         ).status
     except urllib.error.HTTPError as exc:
         return exc.code
@@ -79,12 +85,41 @@ def test_chat_tools(page: Page, ready_bot) -> None:
     assert not page.js_errors
 
 
-def test_logged_out_search_is_401(page: Page, ready_bot) -> None:
-    assert _status(ready_bot.base + SEARCH) == 401
-    resp = page.request.get(ready_bot.base + SEARCH)
-    assert resp.status == 401 and "Maple" not in resp.text()
-    page.goto(ready_bot.base + MANUALS)
-    expect(page).to_have_url(re.compile(r"/login\?next="))
+@pytest.mark.parametrize("policy", ["anyone", "signed_in"])
+def test_logged_out_search_is_401(page: Page, ready_bot, policy: str) -> None:
+    admin = admin_web(ready_bot.base)
+    admin.set_policy(policy)
+    try:
+        assert _status(ready_bot.base + SEARCH) == 401
+        resp = page.request.get(ready_bot.base + SEARCH)
+        assert resp.status == 401 and "Maple" not in resp.text()
+        page.goto(ready_bot.base + MANUALS)
+        if policy == "anyone":
+            expect(page.locator("#signin-hint")).to_have_text(
+                "Sign in to search your manuals."
+            )
+            page.locator("#signin").click()
+        expect(page).to_have_url(re.compile(r"/login\?next="))
+    finally:
+        admin.set_policy("anyone")
+
+
+def test_chat_search_manuals_cited(page: Page, ready_bot) -> None:
+    """Signed in: chat -> search_manuals tool -> cited answer (stub emits the tool call)."""
+    admin_login(page, ready_bot.base)
+    page.goto(ready_bot.base + "/")
+    reply = chat(page, 'CALL search_manuals {"query":"' + QUERY + '"}')
+    expect(reply.locator("summary")).to_have_count(1)  # the tool step is shown
+    expect(reply).to_contain_text("Maple Espresso E-20")
+    expect(reply).to_contain_text("Browse or add manuals: /r/manuals-expert/")
+    shots = os.environ.get("GVS_SHOTS_DIR")
+    if shots:
+        page.screenshot(
+            path=str(Path(shots) / "e2e-stub-chat-search.png"), full_page=True
+        )
+    page.goto(ready_bot.base + "/admin")
+    expect(page.locator("body")).to_contain_text("/r/manuals-expert/")
+    assert not page.js_errors
 
 
 def test_user_login_sees_demo_mode(page: Page, ready_bot) -> None:
@@ -93,6 +128,7 @@ def test_user_login_sees_demo_mode(page: Page, ready_bot) -> None:
     if USER not in users:
         admin.add_user(USER, USER_PASSWORD)
     page.goto(ready_bot.base + MANUALS + "?q=" + urllib.parse.quote(QUERY))
+    page.locator("#signin").click()
     expect(page).to_have_url(re.compile(r"/login"))
     page.fill("#username", USER)
     page.fill("#password", USER_PASSWORD)
@@ -125,7 +161,9 @@ def test_mcp_initialize_and_tools(ready_bot) -> None:
     assert found["status"] == "ok" and found["result"] == json.loads(raw)["text"]
 
 
-def test_admin_upload_replaces_demo_manuals(page: Page, ready_bot, tmp_path: Path) -> None:
+def test_admin_upload_replaces_demo_manuals(
+    page: Page, ready_bot, tmp_path: Path
+) -> None:
     """Runs last in this module: after the upload, the demo set is out of results."""
     page.goto(ready_bot.base + "/admin/login")
     page.fill("#password", ADMIN_PASSWORD)
@@ -133,6 +171,20 @@ def test_admin_upload_replaces_demo_manuals(page: Page, ready_bot, tmp_path: Pat
     page.wait_for_load_state()
     page.goto(ready_bot.base + MANUALS)
     expect(page.locator("#demo-mode")).to_contain_text("Demo mode")
+    expect(page.locator("#add-manual")).to_be_visible()
+    scanned = tmp_path / "scanned.pdf"
+    scanned.write_bytes(
+        b"%PDF-1.4\n1 0 obj<</Subtype/Image>>\nstream\n"
+        + zlib.compress(bytes(4096))
+        + b"\nendstream\n"
+    )
+    page.set_input_files("#manual", str(scanned))
+    page.locator("#upload").click()
+    page.wait_for_load_state()
+    expect(page.locator("#upload-msg")).to_contain_text(
+        "No readable text found in this PDF"
+    )
+    expect(page.locator("#manual-list")).not_to_contain_text("scanned.pdf")
     md = tmp_path / "treatment-table.md"
     md.write_text(TABLE_MD, encoding="utf-8")
     page.set_input_files("#manual", str(md))
@@ -142,7 +194,12 @@ def test_admin_upload_replaces_demo_manuals(page: Page, ready_bot, tmp_path: Pat
     expect(page.locator("#demo-manuals")).to_have_count(0)
     expect(page.locator("#manual-list")).to_contain_text("treatment-table.md")
     expect(page.locator("#manual-list")).not_to_contain_text("maple-espresso")
-    page.goto(ready_bot.base + MANUALS + "?q=" + urllib.parse.quote("can I clean the table with alcohol"))
+    page.goto(
+        ready_bot.base
+        + MANUALS
+        + "?q="
+        + urllib.parse.quote("can I clean the table with alcohol")
+    )
     expect(page.locator("#results li").first).to_contain_text("Cleaning the upholstery")
     page.goto(ready_bot.base + MANUALS + "?q=" + urllib.parse.quote(QUERY))
     expect(page.locator("#results")).to_contain_text("Not in your manuals")

@@ -3,8 +3,8 @@
 Chat and MCP call ``search_manuals``. REST ``GET /r/manuals-expert/search`` (login
 required) imports ``search_corpus``/``format_hits`` from this file, so both agree.
 
-Manual text is untrusted data. It is cleaned (HTML comments and instruction-like
-lines removed) before indexing, and every excerpt handed back is fenced and labeled
+Manual text is untrusted data. A best-effort filter strips HTML and blanks some
+instruction-like lines before indexing (it will not catch everything), and every excerpt handed back is fenced and labeled
 as quoted reference text, never as instructions. When nothing relevant matches, the
 answer is "Not in your manuals". Once the owner adds a manual, the bundled demo
 coffee-shop manuals (``bot/demo/manuals/``) are no longer searched.
@@ -27,8 +27,147 @@ DEFAULT_LIMIT = 5
 MAX_LIMIT = 20
 SUFFIXES = (".md", ".pdf")
 MAX_BYTES = 10 * 1024 * 1024
+MAX_INFLATED = (
+    32 * 1024 * 1024
+)  # total decompressed PDF stream bytes per file (PDF bomb cap)
+MAX_TEXT = 2 * 1024 * 1024  # extracted text kept per manual
+MIN_TEXT = 20  # fewer readable characters than this: treat the PDF as unreadable
+MANUALS_URL = "/r/manuals-expert/"
+UNREADABLE = "No readable text found in this PDF (scanned or unsupported encoding)."
+TOO_BIG = "That PDF expands to more than 32 MB of data; it was not added."
 TOKEN = re.compile(r"[a-z0-9]+")
-STOP = {"a", "about", "after", "again", "all", "also", "am", "an", "and", "any", "are", "as", "at", "be", "been", "before", "being", "both", "but", "by", "can", "could", "did", "do", "does", "doing", "don", "down", "during", "each", "few", "for", "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "him", "his", "how", "i", "if", "in", "into", "is", "it", "its", "just", "me", "might", "more", "most", "must", "my", "no", "nor", "not", "of", "off", "on", "once", "only", "or", "other", "our", "out", "over", "own", "please", "same", "she", "should", "so", "some", "such", "than", "that", "the", "their", "them", "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until", "up", "us", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why", "will", "with", "would", "you", "your", "yours", "tell", "show", "give", "find", "get", "need", "want", "know", "okay", "ok", "hi", "hey", "thanks", "thank"}
+STOP = {
+    "a",
+    "about",
+    "after",
+    "again",
+    "all",
+    "also",
+    "am",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "before",
+    "being",
+    "both",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "doing",
+    "don",
+    "down",
+    "during",
+    "each",
+    "few",
+    "for",
+    "from",
+    "further",
+    "had",
+    "has",
+    "have",
+    "having",
+    "he",
+    "her",
+    "here",
+    "hers",
+    "him",
+    "his",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "just",
+    "me",
+    "might",
+    "more",
+    "most",
+    "must",
+    "my",
+    "no",
+    "nor",
+    "not",
+    "of",
+    "off",
+    "on",
+    "once",
+    "only",
+    "or",
+    "other",
+    "our",
+    "out",
+    "over",
+    "own",
+    "please",
+    "same",
+    "she",
+    "should",
+    "so",
+    "some",
+    "such",
+    "than",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "through",
+    "to",
+    "too",
+    "under",
+    "until",
+    "up",
+    "us",
+    "very",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
+    "yours",
+    "tell",
+    "show",
+    "give",
+    "find",
+    "get",
+    "need",
+    "want",
+    "know",
+    "okay",
+    "ok",
+    "hi",
+    "hey",
+    "thanks",
+    "thank",
+}
 DEMO_NOTE = (
     "Demo mode: no AI key is set, so this bot shows search results only. "
     "Real answers need your own AI provider key (bot admin > Settings)."
@@ -97,18 +236,36 @@ def corpus(data_dir: Path) -> tuple[list[Path], bool]:
 # ---- text ----------------------------------------------------------------------------
 
 
+class PdfTooLarge(ValueError):
+    """The PDF's streams inflate past MAX_INFLATED (likely a decompression bomb)."""
+
+
+_STR = rb"\((?:\\.|[^\\)])*\)|<[0-9A-Fa-f\s]*>"
+
+
+def _pdf_str(tok: bytes) -> str:
+    if tok.startswith(b"<"):
+        hexd = re.sub(rb"\s", b"", tok[1:-1])
+        if len(hexd) % 2:
+            hexd += b"0"
+        raw = bytes.fromhex(hexd.decode())
+        if raw.startswith(b"\xfe\xff"):
+            return raw[2:].decode("utf-16-be", errors="replace")
+        return raw.decode("latin-1")
+    return _pdf_unescape(tok[1:-1])
+
+
 def _pdf_strings(content: bytes) -> list[str]:
     out: list[str] = []
-    for block in re.findall(rb"BT(.*?)ET", content, re.DOTALL):
+    for block in re.findall(rb"\bBT\b(.*?)\bET\b", content, re.DOTALL):
         line: list[str] = []
-        for m in re.finditer(rb"\((?:\\.|[^\\)])*\)|\[(.*?)\]\s*TJ|(T\*|Td|TD|')", block, re.DOTALL):
+        pat = rb"\[(.*?)\]\s*TJ|(" + _STR + rb")|(T\*|Td|TD|')"
+        for m in re.finditer(pat, block, re.DOTALL):
             tok = m.group(0)
-            if tok.startswith(b"("):
-                line.append(_pdf_unescape(tok[1:-1]))
-            elif tok.startswith(b"["):
-                line.extend(
-                    _pdf_unescape(s[1:-1]) for s in re.findall(rb"\((?:\\.|[^\\)])*\)", tok)
-                )
+            if tok.startswith(b"["):
+                line.extend(_pdf_str(s) for s in re.findall(_STR, m.group(1)))
+            elif m.group(2):
+                line.append(_pdf_str(tok))
             else:
                 line.append("\n")
         out.append("".join(line))
@@ -140,24 +297,69 @@ def _pdf_unescape(raw: bytes) -> str:
 
 
 def pdf_text(data: bytes) -> str:
-    """Best-effort text from a simple text PDF (Flate or plain streams, no OCR)."""
+    """Best-effort text from a simple text PDF (Flate or plain streams, no OCR).
+
+    Inflation is capped at MAX_INFLATED bytes per file (raises PdfTooLarge) and the
+    extracted text at MAX_TEXT characters.
+    """
     texts: list[str] = []
-    for m in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", data, re.DOTALL):
+    budget = MAX_INFLATED
+    size = 0
+    for m in re.finditer(
+        rb"stream(?:\r\n|\n|\r)(.*?)(?:\r\n|\n|\r)?endstream", data, re.DOTALL
+    ):
         raw = m.group(1)
         try:
-            raw = zlib.decompress(raw)
+            inflater = zlib.decompressobj()
+            out = inflater.decompress(raw, budget + 1)
+            if len(out) > budget or inflater.unconsumed_tail:
+                raise PdfTooLarge(TOO_BIG)
+            budget -= len(out)
+            raw = out
         except zlib.error:
             pass
-        texts.extend(_pdf_strings(raw))
-    return "\n".join(t for t in texts if t.strip())
+        for t in _pdf_strings(raw):
+            if t.strip():
+                texts.append(t)
+                size += len(t) + 1
+        if size >= MAX_TEXT:
+            break
+    return "\n".join(texts)[:MAX_TEXT]
+
+
+def check_pdf(data: bytes) -> str:
+    """Empty string when the PDF has readable text, else the message for the uploader."""
+    try:
+        text = pdf_text(data)
+    except PdfTooLarge:
+        return TOO_BIG
+    if len(re.sub(r"\s", "", text)) < MIN_TEXT:
+        return UNREADABLE
+    return ""
+
+
+_CACHE: dict[tuple[str, int, int], str] = {}
 
 
 def read_manual(path: Path) -> str:
-    if path.stat().st_size > MAX_BYTES:
+    st = path.stat()
+    if st.st_size > MAX_BYTES:
         return ""
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    if key in _CACHE:
+        return _CACHE[key]
     if path.suffix.lower() == ".pdf":
-        return pdf_text(path.read_bytes())
-    return path.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = pdf_text(path.read_bytes())
+        except PdfTooLarge:
+            text = ""
+    else:
+        text = path.read_text(encoding="utf-8", errors="replace")[:MAX_TEXT]
+    text = clean(text)
+    for old in [k for k in _CACHE if k[0] == key[0]]:
+        del _CACHE[old]
+    _CACHE[key] = text
+    return text
 
 
 def clean(text: str) -> str:
@@ -219,7 +421,7 @@ def search_corpus(
     docs: list[tuple[Path, str, list[tuple[str, str, list[str]]]]] = []
     for path in files:
         try:
-            text = clean(read_manual(path))
+            text = read_manual(path)
         except OSError:
             continue
         title = title_of(path, text)
@@ -266,13 +468,15 @@ def search_corpus(
 
 
 def _fence(text: str) -> str:
-    return text.replace("<manual_excerpt", "&lt;manual_excerpt").replace(
-        "</manual_excerpt", "&lt;/manual_excerpt"
-    )
+    """Excerpts cannot open or close a fence: every '<' and '"' is escaped."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
 
 
 def format_hits(
-    query: str, hits: list[dict[str, Any]], demo_mode: bool = False, demo_set: bool = False
+    query: str,
+    hits: list[dict[str, Any]],
+    demo_mode: bool = False,
+    demo_set: bool = False,
 ) -> str:
     lines: list[str] = []
     if demo_mode:
@@ -284,16 +488,23 @@ def format_hits(
             f"Not in your manuals: nothing relevant matched {query!r}. "
             "Say so plainly; do not guess. Try the model name or one symptom."
         )
+        lines.append(f"Browse or add manuals: {MANUALS_URL}")
         return "\n".join(lines)
     lines.append(FENCE_NOTE)
-    lines.append(f"Found {len(hits)} matching section(s) for {query!r}:")
+    lines.append(
+        f"Found {len(hits)} matching section(s) for {query!r}. Cite the manual title and "
+        "section you use."
+    )
     for i, hit in enumerate(hits, 1):
-        where = f"{hit['title']} > {hit['section']}" if hit.get("section") else hit["title"]
+        where = (
+            f"{hit['title']} > {hit['section']}" if hit.get("section") else hit["title"]
+        )
         lines.append(f"{i}. {where} ({hit['path']}, score={hit['score']:g})")
         lines.append(
             f'<manual_excerpt source="{_fence(hit["path"])}" trust="untrusted-data">\n'
             f"{_fence(hit['snippet'])}\n</manual_excerpt>"
         )
+    lines.append(f"Browse or add manuals: {MANUALS_URL}")
     return "\n".join(lines)
 
 
@@ -325,7 +536,9 @@ def search_manuals(
     **_: Any,
 ) -> str:
     if actor in ("", "visitor"):
-        return "Sign in to search the manuals (bot admin: add a user under Settings)."
+        return (
+            "Sign in to search the manuals (bot admin: add a user under Admin > Users)."
+        )
     return run_search(store, query, limit)["text"]
 
 
@@ -338,7 +551,10 @@ if "search_manuals" not in registered():
         schema={
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Words to find in the manuals"},
+                "query": {
+                    "type": "string",
+                    "description": "Words to find in the manuals",
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Max hits (1-20)",
