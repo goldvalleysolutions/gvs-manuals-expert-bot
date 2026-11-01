@@ -1,7 +1,8 @@
 """Manuals Expert Bot walkthrough over web chat, the admin forms and MCP (no REST API).
 
-The manual search under /r/manuals-expert/ is ``@user_level``: it follows the access
-policy (Anyone: opens logged out; Signed-in users only: /login first).
+The manuals pages under /r/manuals-expert/ always need a signed-in account: logged out,
+search is 401 under either access policy. /health must show the 0.1.x bot version and
+image tag (never :dev).
 
 Usage: manuals_expert_steps_http.py BASE SMTP_HOST SMTP_PORT CTL BOT_ID
 (SMTP and the root key are unused here; the signature matches the other bots.)
@@ -43,7 +44,12 @@ def main() -> None:
     assert "SMTP_HOST" not in page
     web.setup()
     code, home = web.get("/")
-    assert code == 200 and BRAND in home and "in a Box" not in home and "Powered by Gold Valley Solutions" in home
+    assert (
+        code == 200
+        and BRAND in home
+        and "in a Box" not in home
+        and "Powered by Gold Valley Solutions" in home
+    )
 
     print("step 2 clock")
     assert web.ask("CALL clock.now {}")["blocked"] is False
@@ -51,17 +57,27 @@ def main() -> None:
     print("step 3 search_manuals")
     assert web.ask('CALL search_manuals {"query":"' + QUERY + '"}')["blocked"] is False
 
-    print("step 4 search route parity (@user_level: follows the access policy)")
+    print("step 4 search needs login (401 logged out), then works for a signed-in user")
     path = "/r/manuals-expert/search?q=" + urllib.parse.quote(QUERY)
     admin = Web(base)
     admin.admin_login()
-    check_access_policy(base, admin, ["/", path])
+    check_access_policy(base, admin, ["/"])  # adds user dana
     code, raw = web.get(path)
+    assert code == 401 and "Maple" not in raw, (code, raw[:300])
+    user = Web(base)
+    user.user_login("dana", "dana-pass-12345")
+    code, raw = user.get(path)
     assert code == 200, (code, raw[:300])
     route = json.loads(raw)
     titles = [hit["title"] for hit in route["results"]]
     assert "Maple Espresso E-20" in titles, titles
-    assert "descale" in route["text"].lower()
+    assert "descale" in route["text"].lower() and route["demo_mode"] is True
+    code, html = user.get("/r/manuals-expert/")
+    assert code == 200 and "Demo mode" in html, code
+    code, raw = web.get("/health")
+    health = json.loads(raw)
+    assert health["bot"]["version"].startswith("0.1."), health
+    assert health["image_tag"].endswith(":" + health["bot"]["version"]), health
 
     print("step 5 web blocked")
     assert web.ask("CALL web.browse {}")["blocked"] is True
