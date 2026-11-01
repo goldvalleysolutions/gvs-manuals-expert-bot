@@ -19,8 +19,9 @@ is just an example.) **If port 8085 is taken** (`port is already allocated`), ru
 `docker rm manuals-expert` and repeat with another left side, e.g. `-p 8095:8080`, then
 use that port in the links below.
 
-> **Before the 0.1 release:** the image appears on Docker Hub when Manuals 0.1 is
-> released (after Bot Core 0.3). Until then `docker pull` fails; build both images
+> **Publishing:** the image is published to Docker Hub as
+> `goldvalleysolutions/manuals-expert-bot:0.1.0` (and `:0.1`) when the release is merged
+> to main. If `docker pull` fails because that has not happened yet, build both images
 > locally under the published names, then run the same `docker run` line:
 >
 > ```bash
@@ -193,6 +194,10 @@ Apache 2.0. See `LICENSE` and `NOTICE`. Powered by Gold Valley Solutions.
 
 The image is `FROM goldvalleysolutions/core-bot:0.3` (Docker Hub) plus this `bot/` folder,
 copy-only. Build: `docker build -f bot/Dockerfile -t goldvalleysolutions/manuals-expert-bot:0.1.0 .`
+Publishing: `.github/workflows/publish.yml` pushes `goldvalleysolutions/manuals-expert-bot`
+as `X.Y.Z` and `X.Y` (from `version:` in `bot/bot.yaml`, never `latest`; linux/amd64 + linux/arm64)
+only on push to `main`, i.e. when test is merged into main. It needs the `DOCKERHUB_USERNAME`
+and `DOCKERHUB_TOKEN` secrets and fails naming any that is missing. A manual run is a build-only dry run.
 Unit tests: `GVS_CORE_DIR=<core checkout> python -m pytest tests/unit`.
 All checks: `GVS_E2E_REQUIRED=1 scripts/verify-local.sh`.
 
