@@ -23,6 +23,7 @@ from core.sdk import user_level
 from core.ui.html import bot_name, esc, page
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 _TOOLS = Path(__file__).resolve().parent.parent / "tools" / "search.py"
 BASE = "/r/manuals-expert/"
@@ -39,6 +40,25 @@ def _search_mod() -> Any:
 
 _search = _search_mod()
 router = APIRouter()
+
+# Upload outcomes: the redirect carries a code (and the sanitized file name), never
+# free text, so the page only ever shows these fixed strings (S6).
+MESSAGES: dict[str, tuple[str, bool]] = {
+    "added": ("Added {name}.", False),
+    "added_first": ("Added {name}. Demo manuals are now out of results.", False),
+    "type": ("{name}: only .md and .pdf files can be added.", True),
+    "size": ("{name}: that file is empty or over 10 MB.", True),
+    "not_pdf": ("{name}: that file is not a PDF.", True),
+    "unreadable": ("{name}: " + _search.UNREADABLE, True),
+    "too_big": ("{name}: " + _search.TOO_BIG, True),
+    "exists": (
+        (
+            "{name}: a manual with this name already exists. Rename the file and "
+            "upload it again."
+        ),
+        True,
+    ),
+}
 
 
 def _signed_in(request: Request) -> Any:
@@ -80,7 +100,9 @@ def safe_name(name: str) -> str:
 
 @router.get("/")
 @user_level
-def manuals_page(request: Request, q: str = "", msg: str = "") -> Response:
+def manuals_page(
+    request: Request, q: str = "", msg: str = "", name: str = ""
+) -> Response:
     actor = _signed_in(request)
     if actor is None:
         return _to_login(request)
@@ -98,8 +120,17 @@ def manuals_page(request: Request, q: str = "", msg: str = "") -> Response:
             "<p id=demo-manuals><strong>Demo manuals</strong>: these coffee-shop manuals "
             "are examples. Add your own and they drop out of results.</p>"
         )
-    if msg:
-        bits.append(f"<p class=toast role=status id=upload-msg>{esc(msg)}</p>")
+    if msg in MESSAGES:
+        text, is_error = MESSAGES[msg]
+        shown = text.format(name=safe_name(name) or "File")
+        if is_error:
+            bits.append(
+                f"<p class='toast error' role=alert id=upload-msg>{esc(shown)}</p>"
+            )
+        else:
+            bits.append(
+                f"<p class='toast ok' role=status id=upload-msg>{esc(shown)}</p>"
+            )
     bits.append(
         f"<form method=get action={BASE} class=manual-search>"
         "<label for=q>Ask your manuals</label>"
@@ -150,31 +181,55 @@ async def upload(request: Request) -> Response:
         return JSONResponse(
             {"error": "Only the bot admin can add manuals."}, status_code=403
         )
+    # S2: refuse an oversize body before parsing it (form overhead allowed for).
+    try:
+        length = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        length = 0
+    if length > _search.MAX_BYTES + 64 * 1024:
+        return _back("size")
     form = await request.form()
     if not csrf.valid(request, {"csrf": str(form.get("csrf") or "")}):
         return JSONResponse(
             {"error": "Form expired; reload and try again."}, status_code=403
         )
     item = form.get("manual")
-    name = safe_name(getattr(item, "filename", "") or "")
+    raw_name = getattr(item, "filename", "") or ""
+    name = safe_name(raw_name)
     if item is None or not hasattr(item, "read") or not name.endswith(_search.SUFFIXES):
-        return _back("Only .md and .pdf files can be added.")
-    data = await item.read()  # type: ignore[union-attr]
+        return _back("type", name or safe_name(raw_name + ".x"))
+    size = getattr(item, "size", None)
+    if size is not None and size > _search.MAX_BYTES:
+        return _back("size", name)
+    data = await item.read(_search.MAX_BYTES + 1)  # type: ignore[union-attr]
     if not data or len(data) > _search.MAX_BYTES:
-        return _back("That file is empty or over 10 MB.")
+        return _back("size", name)
     if name.endswith(".pdf") and not data.startswith(b"%PDF"):
-        return _back("That file is not a PDF.")
+        return _back("not_pdf", name)
     if name.endswith(".pdf"):
-        problem = _search.check_pdf(data)
+        # S3: parsing is CPU work; keep it off the event loop.
+        problem = await run_in_threadpool(_search.check_pdf, data)
         if problem:
-            return _back(problem)
-    dest = _search.ensure_store(Path(request.app.state.store.data_dir)) / name
+            return _back(
+                "too_big" if problem == _search.TOO_BIG else "unreadable", name
+            )
+    store = request.app.state.store
+    folder = _search.ensure_store(Path(store.data_dir))
+    dest = folder / name
+    if dest.exists():
+        store.log(
+            actor.name,
+            "manuals.upload_refused",
+            f"file={name} reason=exists",
+            source="web",
+        )
+        return _back("exists", name)
+    first = not _search.manual_files(folder)
     dest.write_bytes(data)
-    request.app.state.store.log(
-        actor.name, "manuals.upload", f"file={name}", source="web"
-    )
-    return _back(f"Added {name}. Demo manuals are now out of results.")
+    store.log(actor.name, "manuals.upload", f"file={name}", source="web")
+    return _back("added_first" if first else "added", name)
 
 
-def _back(msg: str) -> Response:
-    return RedirectResponse(BASE + "?" + urlencode({"msg": msg}), status_code=303)
+def _back(code: str, name: str = "") -> Response:
+    query = {"msg": code, "name": name} if name else {"msg": code}
+    return RedirectResponse(BASE + "?" + urlencode(query), status_code=303)

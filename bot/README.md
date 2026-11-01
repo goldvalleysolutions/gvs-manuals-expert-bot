@@ -19,6 +19,18 @@ is just an example.) **If port 8085 is taken** (`port is already allocated`), ru
 `docker rm manuals-expert` and repeat with another left side, e.g. `-p 8095:8080`, then
 use that port in the links below.
 
+> **Before the 0.1 release:** the image appears on Docker Hub when Manuals 0.1 is
+> released (after Bot Core 0.3). Until then `docker pull` fails; build both images
+> locally under the published names, then run the same `docker run` line:
+>
+> ```bash
+> git clone https://github.com/goldvalleysolutions/gvs-core-bot.git
+> docker build -t goldvalleysolutions/core-bot:0.3 gvs-core-bot
+> git clone https://github.com/goldvalleysolutions/gvs-manuals-expert-bot.git
+> cd gvs-manuals-expert-bot
+> docker build -f bot/Dockerfile -t goldvalleysolutions/manuals-expert-bot:0.1.0 .
+> ```
+
 Step 2: open <http://localhost:8085>. Every page redirects to **`/setup`** until you
 finish it: create the bot-admin password, choose who can use the bot, pick the AI
 model, then run the self-test. `curl -f http://localhost:8085/health` works before and
@@ -49,9 +61,11 @@ search endpoint.
 As soon as you add one manual of your own, the demo coffee-shop manuals drop out of
 every result.
 
-- **Find it:** the Manuals page is <http://localhost:8085/r/manuals-expert/>. Chat
-  answers end with a "Browse or add manuals" link, and **Admin > Settings** shows a
-  Manuals pointer.
+- **Find it:** the Manuals page is <http://localhost:8085/r/manuals-expert/>. Every
+  manual search result the model receives ends with "Browse or add manuals:
+  /r/manuals-expert/", and the bot is told to end its answers with that line (most
+  answers do; it is a model instruction, not a guarantee). **Admin > Settings** always
+  shows a Manuals pointer.
 - **Upload in the browser:** sign in as bot admin and open
   <http://localhost:8085/r/manuals-expert/> > **Add a manual**. Markdown (`.md`) or text PDF
   (`.pdf`), up to 10 MB each.
@@ -176,14 +190,14 @@ All checks: `GVS_E2E_REQUIRED=1 scripts/verify-local.sh`.
 
 ## End-to-end tests (Playwright)
 
-`tests/e2e/` starts the bot on core from source (pinned to gvs-core-bot `a1a5b5d`) with
+`tests/e2e/` starts the bot on core from source (pinned to gvs-core-bot `858d30e`) with
 uvicorn, a temp `/data` and the stub model, then drives it in Chromium at desktop
 (1280x800) and mobile (390x844) sizes. `verify-local.sh` runs it through
 `.verify-local.env`, and it must pass before merge.
 
 ```bash
 git clone https://github.com/goldvalleysolutions/gvs-core-bot.git ../gvs-core-bot
-git -C ../gvs-core-bot checkout a1a5b5d
+git -C ../gvs-core-bot checkout 858d30e
 pip install -r ../gvs-core-bot/requirements.txt -r tests/e2e/requirements.txt
 python -m playwright install chromium
 GVS_CORE_DIR=../gvs-core-bot python -m pytest tests/e2e -q

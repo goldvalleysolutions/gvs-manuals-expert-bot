@@ -181,18 +181,51 @@ def test_admin_upload_replaces_demo_manuals(
     page.set_input_files("#manual", str(scanned))
     page.locator("#upload").click()
     page.wait_for_load_state()
-    expect(page.locator("#upload-msg")).to_contain_text(
-        "No readable text found in this PDF"
-    )
+    msg = page.locator("#upload-msg")
+    expect(msg).to_contain_text("scanned.pdf: No readable text found in this PDF")
+    expect(msg).to_have_attribute("role", "alert")
+    expect(msg).to_have_class(re.compile(r"\berror\b"))
     expect(page.locator("#manual-list")).not_to_contain_text("scanned.pdf")
-    md = tmp_path / "treatment-table.md"
+    big = tmp_path / "huge.md"
+    big.write_bytes(b"# Huge\n" + b"x" * (10 * 1024 * 1024))
+    page.set_input_files("#manual", str(big))
+    page.locator("#upload").click()
+    page.wait_for_load_state()
+    expect(msg).to_contain_text("huge.md: that file is empty or over 10 MB.")
+    expect(page.locator("#manual-list")).not_to_contain_text("huge.md")
+    # Free text in ?msg= is never shown; only known codes map to fixed strings.
+    page.goto(ready_bot.base + MANUALS + "?msg=" + urllib.parse.quote("Call 555-EVIL"))
+    expect(page.locator("#upload-msg")).to_have_count(0)
+    expect(page.locator("body")).not_to_contain_text("555-EVIL")
+    first = page.locator("#demo-manuals").count() == 1  # desktop and mobile share a bot
+    tag = str(page.viewport_size["width"])
+    md = tmp_path / f"treatment-table-{tag}.md"
     md.write_text(TABLE_MD, encoding="utf-8")
     page.set_input_files("#manual", str(md))
     page.locator("#upload").click()
     page.wait_for_load_state()
-    expect(page.locator("#upload-msg")).to_contain_text("Added treatment-table.md")
+    added = f"Added treatment-table-{tag}.md."
+    demo_out = " Demo manuals are now out of results."
+    expect(msg).to_have_text(added + demo_out if first else added)
+    expect(msg).to_have_attribute("role", "status")
+    # Same name again: refused, nothing overwritten.
+    md.write_text("# Replaced\n\n## Other\nother text\n", encoding="utf-8")
+    page.set_input_files("#manual", str(md))
+    page.locator("#upload").click()
+    page.wait_for_load_state()
+    expect(msg).to_contain_text(
+        f"treatment-table-{tag}.md: a manual with this name already exists"
+    )
+    expect(msg).to_have_attribute("role", "alert")
+    # A second, different manual: no "demo out of results" claim any more.
+    second = tmp_path / f"ice-notes-{tag}.md"
+    second.write_text("# Ice notes\n\n## Bin\nEmpty the bin daily.\n", encoding="utf-8")
+    page.set_input_files("#manual", str(second))
+    page.locator("#upload").click()
+    page.wait_for_load_state()
+    expect(msg).to_have_text(f"Added ice-notes-{tag}.md.")
     expect(page.locator("#demo-manuals")).to_have_count(0)
-    expect(page.locator("#manual-list")).to_contain_text("treatment-table.md")
+    expect(page.locator("#manual-list")).to_contain_text(f"treatment-table-{tag}.md")
     expect(page.locator("#manual-list")).not_to_contain_text("maple-espresso")
     page.goto(
         ready_bot.base
