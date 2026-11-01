@@ -12,31 +12,37 @@ coffee-shop manuals (``bot/demo/manuals/``) are no longer searched.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
-import zlib
 from pathlib import Path
 from typing import Any
 
+from core.pdf import (
+    PdfExtractBusy,
+    PdfExtractError,
+    PdfExtractTimeout,
+    PdfExtractTooLarge,
+    extract_pdf_text,
+    extract_pdf_text_async,
+)
 from core.sdk import tool
 from core.tools.registry import registered
+
+log = logging.getLogger("gvs.manuals")
 
 SLUG = "manuals-expert"
 DEFAULT_LIMIT = 5
 MAX_LIMIT = 20
 SUFFIXES = (".md", ".pdf")
 MAX_BYTES = 10 * 1024 * 1024
-MAX_INFLATED = (
-    32 * 1024 * 1024
-)  # total decompressed PDF stream bytes per file (PDF bomb cap)
-MAX_TEXT = 2 * 1024 * 1024  # extracted text kept per manual
-MIN_TEXT = 20  # fewer readable characters than this: treat the PDF as unreadable
+MAX_TEXT = 2 * 1024 * 1024  # .md text kept per manual (core.pdf caps PDFs the same)
+MIN_WORDS = 3  # fewer searchable words than this: treat the PDF as unreadable
 MANUALS_URL = "/r/manuals-expert/"
 POINTER = f"Browse or add manuals: {MANUALS_URL}"
 POINTER_NOTE = f"End your reply with this exact line: {POINTER}"
 UNREADABLE = "No readable text found in this PDF (scanned or unsupported encoding)."
-TOO_BIG = "That PDF expands to more than 32 MB of data; it was not added."
 TOKEN = re.compile(r"[a-z0-9]+")
 STOP = {
     "a",
@@ -238,162 +244,70 @@ def corpus(data_dir: Path) -> tuple[list[Path], bool]:
 # ---- text ----------------------------------------------------------------------------
 
 
-class PdfTooLarge(ValueError):
-    """The PDF's streams inflate past MAX_INFLATED (likely a decompression bomb)."""
+# PDF text comes from core.pdf: a child process with a timeout, rlimits and a
+# concurrency limit (Core PR #41). The bot only turns that text into sections.
 
 
-# One linear pass: every alternative is a plain character class, so no input can make
-# the tokenizer backtrack (no ``BT(.*?)ET`` / ``\[(.*?)\]`` scans).
-_TOK = re.compile(rb"\\[\s\S]|[()<>\[\]]|[A-Za-z*'\"]+|[^\\()<>\[\]A-Za-z*'\"]+")
-MAX_STREAMS = 5000
+def pdf_text(data: bytes, name: str = "") -> str:
+    """Text of a text PDF via core.pdf (blocking). Raises core's PdfExtractError."""
+    return extract_pdf_text(data, name=name)
 
 
-def _pdf_hex(raw: bytes) -> str:
-    hexd = re.sub(rb"[^0-9A-Fa-f]", b"", raw)
-    if len(hexd) % 2:
-        hexd += b"0"
-    data = bytes.fromhex(hexd.decode())
-    if data.startswith(b"\xfe\xff"):
-        return data[2:].decode("utf-16-be", errors="replace")
-    return data.decode("latin-1")
+_PDF_HEADING = re.compile(
+    r"\s*((section|chapter|part)\s+\d+[A-Za-z]?[.:)]?\s+\S.{0,80}|\d{1,2}(\.\d{1,2}){0,2}\.?\s+[A-Z].{0,60})\s*$",
+    re.IGNORECASE,
+)
 
 
-def _pdf_strings(content: bytes, limit: int = MAX_TEXT) -> list[str]:
-    """Text of each BT..ET block, from (literal) and <hex> strings shown by Tj/TJ/'/"."""
+def pdf_markdown(text: str) -> str:
+    """PDF text has no Markdown headings: make the first line the title and numbered
+    "Section 4: ..." / "2.1 Cleaning" lines section headings, so search can cite them."""
     out: list[str] = []
-    line: list[str] = []
-    pending: list[str] = []
-    in_bt = False
-    used = 0
-    toks = (m.group(0) for m in _TOK.finditer(content))
-    for tok in toks:
-        if tok == b"(":
-            depth, buf = 1, bytearray()
-            for t in toks:
-                if t == b"(":
-                    depth += 1
-                elif t == b")":
-                    depth -= 1
-                    if not depth:
-                        break
-                buf += t
-            if in_bt:
-                pending.append(_pdf_unescape(bytes(buf)))
-        elif tok == b"<":
-            buf = bytearray()
-            for t in toks:
-                if t in (b">", b"<"):
-                    break
-                buf += t
-            if in_bt and buf:
-                pending.append(_pdf_hex(bytes(buf)))
-        elif not in_bt:
-            in_bt = tok == b"BT"
-            line, pending = [], []
-        elif tok == b"ET":
-            out.append("".join(line))
-            used += len(out[-1])
-            in_bt = False
-            if used >= limit:
-                break
-        elif tok in (b"Tj", b"TJ", b"'", b'"'):
-            if tok in (b"'", b'"'):
-                line.append("\n")
-            for piece in pending:
-                line.append(piece)
-                used += len(piece)
-            pending = []
-            if used >= limit:  # S4: cap inside the per-string loop
-                out.append("".join(line))
-                break
-        elif tok in (b"T*", b"Td", b"TD"):
-            line.append("\n")
-    return out
-
-
-def _pdf_unescape(raw: bytes) -> str:
-    maps = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"(": b"(", b")": b")", b"\\": b"\\"}
-    res = bytearray()
-    i = 0
-    while i < len(raw):
-        ch = raw[i : i + 1]
-        if ch == b"\\" and i + 1 < len(raw):
-            nxt = raw[i + 1 : i + 2]
-            if nxt in maps:
-                res += maps[nxt]
-                i += 2
-                continue
-            octal = re.match(rb"[0-7]{1,3}", raw[i + 1 : i + 4])
-            if octal:
-                res.append(int(octal.group(0), 8) & 0xFF)
-                i += 1 + len(octal.group(0))
-                continue
-            i += 1
+    titled = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
             continue
-        res += ch
-        i += 1
-    return res.decode("latin-1")
-
-
-def _streams(data: bytes):
-    """Raw stream bodies, found with str.find (linear), at most MAX_STREAMS."""
-    pos = 0
-    for _ in range(MAX_STREAMS):
-        i = data.find(b"stream", pos)
-        if i < 0:
-            return
-        start = i + 6
-        if data[start : start + 2] == b"\r\n":
-            start += 2
-        elif data[start : start + 1] in (b"\n", b"\r"):
-            start += 1
+        if not titled:
+            out.append("# " + stripped)
+            titled = True
+        elif len(stripped) <= 90 and _PDF_HEADING.fullmatch(stripped):
+            out.append("## " + stripped)
         else:
-            pos = start
-            continue
-        end = data.find(b"endstream", start)
-        if end < 0:
-            return
-        yield data[start:end].rstrip(b"\r\n")
-        pos = end + 9
+            out.append(stripped)
+    return "\n".join(out)
 
 
-def pdf_text(data: bytes) -> str:
-    """Best-effort text from a simple text PDF (Flate or plain streams, no OCR).
-
-    Inflation is capped at MAX_INFLATED bytes per file (raises PdfTooLarge), streams at
-    MAX_STREAMS and the extracted text at MAX_TEXT characters.
-    """
-    texts: list[str] = []
-    budget = MAX_INFLATED
-    left = MAX_TEXT
-    for raw in _streams(data):
-        try:
-            inflater = zlib.decompressobj()
-            out = inflater.decompress(raw, budget + 1)
-            if len(out) > budget or inflater.unconsumed_tail:
-                raise PdfTooLarge(TOO_BIG)
-            budget -= len(out)
-            raw = out
-        except zlib.error:
-            pass
-        for t in _pdf_strings(raw, left):
-            if t.strip():
-                texts.append(t)
-                left -= len(t) + 1
-        if left <= 0:
-            break
-    return "\n".join(texts)[:MAX_TEXT]
+def index_chunks(text: str, cleaned: bool = False) -> int:
+    """Searchable sections in manual text (0 = nothing would ever match)."""
+    text = text if cleaned else clean(text)
+    return sum(1 for h, b in sections_of(text) if terms(h + " " + b))
 
 
-def check_pdf(data: bytes) -> str:
-    """Empty string when the PDF has readable text, else the message for the uploader."""
+def pdf_unreadable(text: str) -> bool:
+    """No text layer (scanned: core returns ""), too few words, or 0 sections."""
+    return len(terms(text)) < MIN_WORDS or not index_chunks(pdf_markdown(text))
+
+
+async def check_pdf(data: bytes, name: str = "") -> str:
+    """ "" when the PDF has searchable text, else an upload refusal code: the core.pdf
+    error kind (its user-safe message is shown as-is) or "unreadable"."""
     try:
-        text = pdf_text(data)
-    except PdfTooLarge:
-        return TOO_BIG
-    if len(re.sub(r"\s", "", text)) < MIN_TEXT:
-        return UNREADABLE
-    return ""
+        text = await extract_pdf_text_async(data, name=name)
+    except PdfExtractError as err:
+        return pdf_error_code(err)
+    return "unreadable" if pdf_unreadable(text) else ""
+
+
+def pdf_error_code(err: PdfExtractError) -> str:
+    for kind, code in (
+        (PdfExtractTimeout, "pdf_complex"),
+        (PdfExtractTooLarge, "pdf_large"),
+        (PdfExtractBusy, "pdf_busy"),
+    ):
+        if isinstance(err, kind):
+            return code
+    return "pdf_damaged"
 
 
 _CACHE: dict[tuple[str, int, int], str] = {}
@@ -408,12 +322,16 @@ def read_manual(path: Path) -> str:
         return _CACHE[key]
     if path.suffix.lower() == ".pdf":
         try:
-            text = pdf_text(path.read_bytes())
-        except PdfTooLarge:
-            text = ""
+            text = pdf_markdown(pdf_text(path.read_bytes(), name=path.name))
+        except PdfExtractError:
+            text = ""  # logged by core (file name only); not indexed
     else:
         text = path.read_text(encoding="utf-8", errors="replace")[:MAX_TEXT]
     text = clean(text)
+    if not index_chunks(text, cleaned=True):
+        # A file dropped in with docker cp (or a PDF we cannot read) would otherwise
+        # vanish from search without a trace.
+        log.warning("manuals: %s has no searchable text; it is not indexed", path.name)
     for old in [k for k in _CACHE if k[0] == key[0]]:
         del _CACHE[old]
     _CACHE[key] = text
@@ -423,7 +341,7 @@ def read_manual(path: Path) -> str:
 def clean(text: str) -> str:
     """Strip HTML comments/tags and instruction-like lines; manual text is data."""
     text = re.sub(r"<!--.*?(-->|$)", " ", text, flags=re.DOTALL)
-    text = re.sub(r"</?[a-zA-Z][^>]*>", " ", text)
+    text = re.sub(r"</?[a-zA-Z][^<>]*>", " ", text)  # [^<>]: linear on "<a<a<a"
     lines = [REMOVED if INJECTION.search(line) else line for line in text.splitlines()]
     return "\n".join(lines)
 
@@ -514,6 +432,9 @@ def search_corpus(
                     score += idf[t] * 0.5
             if best is None or score > best[0]:
                 best = (score, heading, body)
+        if best is None and secs and all(t in t_terms for t in q_terms):
+            # The question only names the manual ("Game Ready"): show its first section.
+            best = (sum(idf[t] for t in q_terms) * 0.5, secs[0][0], secs[0][1])
         if best:
             hits.append(
                 {

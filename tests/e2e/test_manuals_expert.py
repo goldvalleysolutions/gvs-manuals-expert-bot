@@ -193,12 +193,48 @@ def test_admin_upload_replaces_demo_manuals(
     page.wait_for_load_state()
     expect(msg).to_contain_text("huge.md: that file is empty or over 10 MB.")
     expect(page.locator("#manual-list")).not_to_contain_text("huge.md")
+    # A file that indexes to 0 sections is refused loudly, not "Added".
+    blank = tmp_path / "blank-notes.md"
+    blank.write_text("<!-- only a comment -->\n\n---\n", encoding="utf-8")
+    page.set_input_files("#manual", str(blank))
+    page.locator("#upload").click()
+    page.wait_for_load_state()
+    expect(msg).to_have_text(
+        "blank-notes.md: no searchable text found in this file (0 sections indexed), "
+        "so it was not added."
+    )
+    expect(msg).to_have_attribute("role", "alert")
+    expect(msg).to_have_class(re.compile(r"\berror\b"))
+    expect(page.locator("#manual-list")).not_to_contain_text("blank-notes.md")
+    # A PDF with words but one line only (title, 0 sections) is refused too.
+    stream = zlib.compress(
+        b"BT /F1 12 Tf 72 720 Td (Quick reference card for staff) Tj ET"
+    )
+    card = tmp_path / "one-line-card.pdf"
+    card.write_bytes(
+        b"%PDF-1.4\n1 0 obj<</Length "
+        + str(len(stream)).encode()
+        + b"/Filter/FlateDecode>>\nstream\n"
+        + stream
+        + b"\nendstream\nendobj\n%%EOF\n"
+    )
+    page.set_input_files("#manual", str(card))
+    page.locator("#upload").click()
+    page.wait_for_load_state()
+    expect(msg).to_contain_text("one-line-card.pdf: No readable text found in this PDF")
+    expect(msg).to_have_attribute("role", "alert")
+    expect(page.locator("#manual-list")).not_to_contain_text("one-line-card.pdf")
     # Free text in ?msg= is never shown; only known codes map to fixed strings.
     page.goto(ready_bot.base + MANUALS + "?msg=" + urllib.parse.quote("Call 555-EVIL"))
     expect(page.locator("#upload-msg")).to_have_count(0)
     expect(page.locator("body")).not_to_contain_text("555-EVIL")
     first = page.locator("#demo-manuals").count() == 1  # desktop and mobile share a bot
     tag = str(page.viewport_size["width"])
+    # Search hint: espresso example only while the demo set is live.
+    expect(page.locator("#q")).to_have_attribute(
+        "placeholder",
+        "e.g. descale espresso" if first else "e.g. error code or cleaning",
+    )
     md = tmp_path / f"treatment-table-{tag}.md"
     md.write_text(TABLE_MD, encoding="utf-8")
     page.set_input_files("#manual", str(md))
@@ -224,7 +260,27 @@ def test_admin_upload_replaces_demo_manuals(
     page.locator("#upload").click()
     page.wait_for_load_state()
     expect(msg).to_have_text(f"Added ice-notes-{tag}.md.")
+    # LibreOffice PDF (subset TrueType + ToUnicode): added AND searchable.
+    lo_pdf = tmp_path / f"gameready-{tag}.pdf"
+    lo_pdf.write_bytes(
+        (
+            Path(__file__).resolve().parents[1] / "fixtures" / "gameready-cold-unit.pdf"
+        ).read_bytes()
+    )
+    page.set_input_files("#manual", str(lo_pdf))
+    page.locator("#upload").click()
+    page.wait_for_load_state()
+    expect(msg).to_have_text(f"Added gameready-{tag}.pdf.")
+    page.goto(ready_bot.base + MANUALS + "?q=" + urllib.parse.quote("E3 low water"))
+    expect(page.locator("#results li").first).to_contain_text("Game Ready GRPro 2.1")
+    expect(page.locator("#results li").first).to_contain_text(
+        "Fill the reservoir with cold water"
+    )
+    page.goto(ready_bot.base + MANUALS)
     expect(page.locator("#demo-manuals")).to_have_count(0)
+    expect(page.locator("#q")).to_have_attribute(
+        "placeholder", "e.g. error code or cleaning"
+    )
     expect(page.locator("#manual-list")).to_contain_text(f"treatment-table-{tag}.md")
     expect(page.locator("#manual-list")).not_to_contain_text("maple-espresso")
     page.goto(

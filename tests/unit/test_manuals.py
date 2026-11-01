@@ -3,6 +3,7 @@ signed-in search, /health version. Stub model only; no LLM keys."""
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import re
 import sys
@@ -245,18 +246,14 @@ def _bomb(inflated: int) -> bytes:
     )
 
 
-def test_pdf_bomb_is_capped(s, data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(s, "MAX_INFLATED", 1024 * 1024)
-    bomb = _bomb(8 * 1024 * 1024)  # ~8 KB that inflates to 8 MB
-    assert len(bomb) < 20_000
-    with pytest.raises(s.PdfTooLarge):
-        s.pdf_text(bomb)
-    assert s.check_pdf(bomb) == s.TOO_BIG
+def test_pdf_bomb_is_refused_by_core(s, data: Path) -> None:
+    bomb = _bomb(40 * 1024 * 1024)  # ~40 KB that inflates past core's 32 MB cap
+    assert len(bomb) < 100_000
+    assert asyncio.run(s.check_pdf(bomb, "bomb.pdf")) == "pdf_large"
     d = data / "manuals-expert"
     d.mkdir(parents=True, exist_ok=True)
     (d / "bomb.pdf").write_bytes(bomb)
     assert s.read_manual(d / "bomb.pdf") == ""  # dropped at search time too
-    # Under the cap a normal PDF still parses.
     assert "canola" in s.pdf_text(_pdf(["## Seasoning", "oil (canola)"]))
 
 
@@ -273,27 +270,20 @@ def test_extracted_text_is_cached(
 
 
 def test_unreadable_pdf_is_rejected(s) -> None:
+    """core.pdf returns "" for a scanned PDF (no error): the bot refuses it."""
     scanned = (
         b"%PDF-1.4\n1 0 obj<</Subtype/Image/Filter/DCTDecode>>\nstream\n"
         + bytes(range(256)) * 4
         + b"\nendstream\n"
     )
-    assert s.check_pdf(scanned) == s.UNREADABLE
+    assert s.pdf_text(scanned) == ""
+    assert asyncio.run(s.check_pdf(scanned)) == "unreadable"
     assert (
         s.UNREADABLE
         == "No readable text found in this PDF (scanned or unsupported encoding)."
     )
-    assert (
-        s.check_pdf(_pdf(["# Flat top grill FG-9", "## Seasoning", "Wipe oil on it."]))
-        == ""
-    )
-
-
-def test_pdf_hex_strings_and_crlf_streams(s) -> None:
-    body = b"BT /F1 12 Tf <4465736361 6c65> Tj T* [<77656b6c79>] TJ ET"
-    raw = zlib.compress(body)
-    pdf = b"%PDF-1.4\n1 0 obj<<>>\nstream\r\n" + raw + b"\r\nendstream\n"
-    assert s.pdf_text(pdf).split() == ["Descale", "wekly"]
+    good = _pdf(["# Flat top grill FG-9", "## Seasoning", "Wipe oil on it."])
+    assert asyncio.run(s.check_pdf(good)) == ""
 
 
 def test_heading_and_title_stay_inside_the_fence(s, data: Path) -> None:
@@ -317,31 +307,6 @@ def test_heading_and_title_stay_inside_the_fence(s, data: Path) -> None:
     tags = re.findall(r"<\s*/?\s*manual_excerpt", out, re.IGNORECASE)
     assert tags == ["<manual_excerpt", "</manual_excerpt"], tags
     assert out.rstrip().endswith(s.POINTER)
-
-
-@pytest.mark.parametrize(
-    "evil",
-    [
-        b"BT " + b"[" * 300_000 + b" ET",
-        b"BT " + b"(" * 300_000,
-        b"BT " * 200_000,
-        b"[" * 300_000 + b"] TJ",
-        b"<" * 300_000,
-    ],
-)
-def test_pathological_pdf_content_is_fast(s, evil: bytes) -> None:
-    import time
-
-    t0 = time.monotonic()
-    s._pdf_strings(evil)
-    s.pdf_text(b"%PDF-1.4\n" + (b"stream\n" + evil[:1000]) * 20_000)
-    assert time.monotonic() - t0 < 10.0  # linear: ~0.1 s here; quadratic took >300 s
-
-
-def test_text_cap_is_enforced_per_string(s) -> None:
-    body = b"BT " + (b"(" + b"A" * 5000 + b") Tj ") * 50 + b"ET"
-    out = s._pdf_strings(body, limit=1000)
-    assert sum(len(t) for t in out) <= 5000  # stops at the first string past the cap
 
 
 @pytest.mark.parametrize(
@@ -560,6 +525,166 @@ def test_upload_same_name_is_refused_atomically(
     _upload_env(client, monkeypatch, admin=True, csrf_ok=True)
     body = b"# A\n\n## B\ntext\n"
     assert "msg=added_first" in _post(client, "a.md", body).headers["location"]
-    r = _post(client, "a.md", b"# Replaced\n")
+    r = _post(client, "a.md", b"# Replaced\n\n## Other\nother text\n")
     assert "msg=exists" in r.headers["location"]
     assert (data / "manuals-expert" / "a.md").read_bytes() == body
+
+
+# ---- LibreOffice PDF (subset TrueType + ToUnicode CMap) --------------------------------
+
+FIXTURES = REPO / "tests" / "fixtures"
+
+
+def test_libreoffice_pdf_text_is_extracted(s) -> None:
+    data = (FIXTURES / "gameready-cold-unit.pdf").read_bytes()
+    text = s.pdf_text(data)
+    assert "Game Ready GRPro 2.1 Cold Compression Unit" in text
+    assert "Fill the reservoir with cold water" in text
+    assert "Raynaud's phenomenon" in text
+    assert "## Section 4: Error E3 (low water)" in s.pdf_markdown(text)
+    assert asyncio.run(s.check_pdf(data)) == ""
+
+
+@pytest.mark.parametrize(
+    "q, section",
+    [
+        ("E3 low water", "Section 4: Error E3 (low water)"),
+        ("reservoir", "Section 4: Error E3 (low water)"),
+        ("Raynaud", "Section 5: Contraindications"),
+        ("Game Ready", None),
+        ("how do I clean the game ready", "Section 6: Daily cleaning"),
+    ],
+)
+def test_libreoffice_pdf_is_searchable(s, data: Path, q: str, section) -> None:
+    d = data / "manuals-expert"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "gameready-cold-unit.pdf").write_bytes(
+        (FIXTURES / "gameready-cold-unit.pdf").read_bytes()
+    )
+    hits = s.search_corpus(q, data)
+    assert hits, q
+    assert hits[0]["title"].startswith("Game Ready GRPro 2.1")
+    if section:
+        assert hits[0]["section"] == section
+
+
+def test_zero_chunk_drop_in_is_logged(
+    s, data: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    d = data / "manuals-expert"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "blank.md").write_text("<!-- nothing -->\n\n---\n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="gvs.manuals"):
+        s.search_corpus("anything at all", data)
+    assert "blank.md has no searchable text" in caplog.text
+
+
+def test_upload_zero_chunk_md_is_refused(
+    client, data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _upload_env(client, monkeypatch, admin=True, csrf_ok=True)
+    r = _post(client, "blank.md", b"<!-- only a comment -->\n---\n")
+    assert r.status_code == 303 and "msg=no_text" in r.headers["location"]
+    assert "name=blank.md" in r.headers["location"] and _saved(data) == []
+
+
+def test_upload_libreoffice_pdf_is_added(
+    client, data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _upload_env(client, monkeypatch, admin=True, csrf_ok=True)
+    r = _post(
+        client,
+        "gameready-cold-unit.pdf",
+        (FIXTURES / "gameready-cold-unit.pdf").read_bytes(),
+    )
+    assert "msg=added_first" in r.headers["location"], r.headers["location"]
+    assert _saved(data) == ["gameready-cold-unit.pdf"]
+
+
+# ---- role: identity and scope -----------------------------------------------------------
+
+
+def test_role_does_not_claim_the_demo_set() -> None:
+    role = (BOT / "role.md").read_text().lower()
+    assert "coffee" not in role  # the demo set is announced only by search results
+
+
+def test_who_are_you_with_owner_manuals_has_no_demo(client, data: Path) -> None:
+    """Core's stub answers "who are you" with the system prompt: it must not mention
+    the demo coffee-shop set once owner manuals are loaded."""
+    from core.services import ask
+
+    _owner(data, "pool.md", POOL)
+    store = client.app.state.store
+    out = ask(store, "who are you", user_key="visitor:x", actor="visitor")[
+        "text"
+    ].lower()
+    assert "manual" in out and "coffee" not in out and "demo" not in out, out
+
+
+def test_role_declines_off_topic() -> None:
+    role = (BOT / "role.md").read_text()
+    assert "## Stay in scope" in role
+    assert "writing emails" in role and "Do not offer a" in role
+    assert "/r/manuals-expert/" in role
+
+
+def test_clean_tag_regex_is_linear(s) -> None:
+    """Panel r3: </?[a-zA-Z][^>]*> restarted at every "<a" (38 s at 400 KB)."""
+    import time
+
+    t0 = time.monotonic()
+    s.clean("<a" * 200_000)
+    assert time.monotonic() - t0 < 2.0
+
+
+def test_check_pdf_words_but_zero_sections_is_refused(s) -> None:
+    """Enough words, but only one line: it becomes the title and leaves 0 sections."""
+    pdf = _pdf(["Quick reference card for staff"])
+    assert len(s.terms(s.pdf_text(pdf))) >= s.MIN_WORDS
+    assert s.index_chunks(s.pdf_markdown(s.pdf_text(pdf))) == 0
+    assert asyncio.run(s.check_pdf(pdf)) == "unreadable"
+
+
+def test_core_pdf_refusals_are_shown_as_is(
+    client, data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each core.pdf error kind maps to a code whose page text is str(err), verbatim."""
+    from core.pdf import runner
+
+    g = _upload_env(client, monkeypatch, admin=True, csrf_ok=True)
+    msgs = g["MESSAGES"]
+    name = "x.pdf"
+    core_text = {
+        "pdf_complex": runner._too_complex(name),
+        "pdf_busy": str(runner._busy(name)),
+    }
+    with pytest.raises(runner.PdfExtractTooLarge) as exc:
+        runner.extract_pdf_text(_bomb(40 * 1024 * 1024), name=name)
+    core_text["pdf_large"] = str(exc.value)
+    core_text["pdf_damaged"] = (  # core/pdf/runner.py, worker exit EXIT_FAILED
+        f"Could not read '{name}': the file looks damaged or isn't a standard PDF. "
+        "Try saving or exporting it as a PDF again and re-upload it."
+    )
+    for code, text in core_text.items():
+        assert msgs[code][0].format(name=name) == text, code
+    r = _post(client, "bomb.pdf", _bomb(40 * 1024 * 1024))
+    assert "msg=pdf_large" in r.headers["location"] and _saved(data) == []
+    r = _post(client, "scan.pdf", b"%PDF-1.4\n1 0 obj<</Subtype/Image>>\nendobj\n")
+    assert "msg=unreadable" in r.headers["location"] and _saved(data) == []
+
+
+def test_search_hint_only_mentions_espresso_in_demo(
+    client, data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    routes = [r for _, rt in client.app.state.loaded["routers"] for r in rt.routes]
+    g = next(r.endpoint for r in routes if r.path == "/").__globals__
+    monkeypatch.setitem(g, "_signed_in", lambda request: _Actor(True))
+    client.app.state.store.set_setting("configured", "1")
+    page = client.get("/r/manuals-expert/").text
+    assert "placeholder='e.g. descale espresso'" in page  # demo manuals in use
+    _owner(data, "pool.md", POOL)
+    page = client.get("/r/manuals-expert/").text
+    assert (
+        "espresso" not in page and "placeholder='e.g. error code or cleaning'" in page
+    )

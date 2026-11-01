@@ -50,7 +50,43 @@ MESSAGES: dict[str, tuple[str, bool]] = {
     "size": ("{name}: that file is empty or over 10 MB.", True),
     "not_pdf": ("{name}: that file is not a PDF.", True),
     "unreadable": ("{name}: " + _search.UNREADABLE, True),
-    "too_big": ("{name}: " + _search.TOO_BIG, True),
+    "no_text": (
+        (
+            "{name}: no searchable text found in this file (0 sections indexed), "
+            "so it was not added."
+        ),
+        True,
+    ),
+    # core.pdf refusals (Core PR #41), worded exactly as str(PdfExtractError): the
+    # redirect carries only the code, so the page shows fixed text (S6).
+    "pdf_complex": (
+        (
+            "Could not read '{name}': it is too large or complex to process. "
+            "Try a smaller file, or split it into parts."
+        ),
+        True,
+    ),
+    "pdf_large": (
+        (
+            "Could not read '{name}': it is too large to process. "
+            "Try a smaller file, or split it into parts."
+        ),
+        True,
+    ),
+    "pdf_busy": (
+        (
+            "Could not read '{name}': the bot is busy processing other files, "
+            "please try again in a moment."
+        ),
+        True,
+    ),
+    "pdf_damaged": (
+        (
+            "Could not read '{name}': the file looks damaged or isn't a standard PDF. "
+            "Try saving or exporting it as a PDF again and re-upload it."
+        ),
+        True,
+    ),
     "exists": (
         (
             "{name}: a manual with this name already exists. Rename the file and "
@@ -120,6 +156,8 @@ def manuals_page(
             "<p id=demo-manuals><strong>Demo manuals</strong>: these coffee-shop manuals "
             "are examples. Add your own and they drop out of results.</p>"
         )
+    # The espresso example only fits the bundled demo manuals.
+    hint = "e.g. descale espresso" if is_demo else "e.g. error code or cleaning"
     if msg in MESSAGES:
         text, is_error = MESSAGES[msg]
         shown = text.format(name=safe_name(name) or "File")
@@ -134,7 +172,7 @@ def manuals_page(
     bits.append(
         f"<form method=get action={BASE} class=manual-search>"
         "<label for=q>Ask your manuals</label>"
-        f"<input id=q name=q value='{esc(q)}' placeholder='e.g. descale espresso'>"
+        f"<input id=q name=q value='{esc(q)}' placeholder='{hint}'>"
         "<button>Search</button></form>"
     )
     if q:
@@ -206,13 +244,15 @@ async def upload(request: Request) -> Response:
         return _back("size", name)
     if name.endswith(".pdf") and not data.startswith(b"%PDF"):
         return _back("not_pdf", name)
+    if name.endswith(".md"):
+        text = data.decode("utf-8", errors="replace")
+        if not await run_in_threadpool(_search.index_chunks, text):
+            return _back("no_text", name)
     if name.endswith(".pdf"):
-        # S3: parsing is CPU work; keep it off the event loop.
-        problem = await run_in_threadpool(_search.check_pdf, data)
+        # core.pdf parses in a child process (timeout, rlimits), off the event loop.
+        problem = await _search.check_pdf(data, name)
         if problem:
-            return _back(
-                "too_big" if problem == _search.TOO_BIG else "unreadable", name
-            )
+            return _back(problem, name)
     store = request.app.state.store
     folder = _search.ensure_store(Path(store.data_dir))
     dest = folder / name
