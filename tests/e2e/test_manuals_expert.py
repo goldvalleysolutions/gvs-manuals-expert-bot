@@ -224,6 +224,23 @@ def test_admin_upload_replaces_demo_manuals(
     page.locator("#upload").click()
     page.wait_for_load_state()
     expect(msg).to_have_text(f"Added ice-notes-{tag}.md.")
+    # LibreOffice PDF (subset TrueType + ToUnicode): added AND searchable.
+    lo_pdf = tmp_path / f"gameready-{tag}.pdf"
+    lo_pdf.write_bytes(
+        (
+            Path(__file__).resolve().parents[1] / "fixtures" / "gameready-cold-unit.pdf"
+        ).read_bytes()
+    )
+    page.set_input_files("#manual", str(lo_pdf))
+    page.locator("#upload").click()
+    page.wait_for_load_state()
+    expect(msg).to_have_text(f"Added gameready-{tag}.pdf.")
+    page.goto(ready_bot.base + MANUALS + "?q=" + urllib.parse.quote("E3 low water"))
+    expect(page.locator("#results li").first).to_contain_text("Game Ready GRPro 2.1")
+    expect(page.locator("#results li").first).to_contain_text(
+        "Fill the reservoir with cold water"
+    )
+    page.goto(ready_bot.base + MANUALS)
     expect(page.locator("#demo-manuals")).to_have_count(0)
     expect(page.locator("#manual-list")).to_contain_text(f"treatment-table-{tag}.md")
     expect(page.locator("#manual-list")).not_to_contain_text("maple-espresso")

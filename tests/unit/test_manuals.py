@@ -560,6 +560,113 @@ def test_upload_same_name_is_refused_atomically(
     _upload_env(client, monkeypatch, admin=True, csrf_ok=True)
     body = b"# A\n\n## B\ntext\n"
     assert "msg=added_first" in _post(client, "a.md", body).headers["location"]
-    r = _post(client, "a.md", b"# Replaced\n")
+    r = _post(client, "a.md", b"# Replaced\n\n## Other\nother text\n")
     assert "msg=exists" in r.headers["location"]
     assert (data / "manuals-expert" / "a.md").read_bytes() == body
+
+
+# ---- LibreOffice PDF (subset TrueType + ToUnicode CMap) --------------------------------
+
+FIXTURES = REPO / "tests" / "fixtures"
+
+
+def test_libreoffice_pdf_text_is_extracted(s) -> None:
+    text = s.pdf_text((FIXTURES / "gameready-cold-unit.pdf").read_bytes())
+    assert "Game Ready GRPro 2.1 Cold Compression Unit" in text
+    assert "Fill the reservoir with cold water" in text
+    assert "Raynaud's phenomenon" in text
+    assert s.check_pdf((FIXTURES / "gameready-cold-unit.pdf").read_bytes()) == ""
+
+
+@pytest.mark.parametrize(
+    "q, section",
+    [
+        ("E3 low water", "Section 4: Error E3 (low water)"),
+        ("reservoir", "Section 4: Error E3 (low water)"),
+        ("Raynaud", "Section 5: Contraindications"),
+        ("Game Ready", None),
+        ("how do I clean the game ready", "Section 6: Daily cleaning"),
+    ],
+)
+def test_libreoffice_pdf_is_searchable(s, data: Path, q: str, section) -> None:
+    d = data / "manuals-expert"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "gameready-cold-unit.pdf").write_bytes(
+        (FIXTURES / "gameready-cold-unit.pdf").read_bytes()
+    )
+    hits = s.search_corpus(q, data)
+    assert hits, q
+    assert hits[0]["title"].startswith("Game Ready GRPro 2.1")
+    if section:
+        assert hits[0]["section"] == section
+
+
+def test_cmap_bfrange_and_two_byte_codes(s) -> None:
+    cmap = s.parse_cmap(
+        b"begincodespacerange <0000> <FFFF> endcodespacerange "
+        b"2 beginbfchar <0001> <0048> <0002> <0069> endbfchar "
+        b"1 beginbfrange <0010> <0012> <0061> endbfrange"
+    )
+    assert cmap.width == 2
+    assert cmap.decode(bytes.fromhex("000100020010001100120000")) == "Hiabc"
+
+
+def test_zero_chunk_drop_in_is_logged(
+    s, data: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    d = data / "manuals-expert"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "blank.md").write_text("<!-- nothing -->\n\n---\n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="gvs.manuals"):
+        s.search_corpus("anything at all", data)
+    assert "blank.md has no searchable text" in caplog.text
+
+
+def test_upload_zero_chunk_md_is_refused(
+    client, data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _upload_env(client, monkeypatch, admin=True, csrf_ok=True)
+    r = _post(client, "blank.md", b"<!-- only a comment -->\n---\n")
+    assert r.status_code == 303 and "msg=no_text" in r.headers["location"]
+    assert "name=blank.md" in r.headers["location"] and _saved(data) == []
+
+
+def test_upload_libreoffice_pdf_is_added(
+    client, data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _upload_env(client, monkeypatch, admin=True, csrf_ok=True)
+    r = _post(
+        client,
+        "gameready-cold-unit.pdf",
+        (FIXTURES / "gameready-cold-unit.pdf").read_bytes(),
+    )
+    assert "msg=added_first" in r.headers["location"], r.headers["location"]
+    assert _saved(data) == ["gameready-cold-unit.pdf"]
+
+
+# ---- role: identity and scope -----------------------------------------------------------
+
+
+def test_role_does_not_claim_the_demo_set() -> None:
+    role = (BOT / "role.md").read_text().lower()
+    assert "coffee" not in role  # the demo set is announced only by search results
+
+
+def test_who_are_you_with_owner_manuals_has_no_demo(client, data: Path) -> None:
+    """Core's stub answers "who are you" with the system prompt: it must not mention
+    the demo coffee-shop set once owner manuals are loaded."""
+    from core.services import ask
+
+    _owner(data, "pool.md", POOL)
+    store = client.app.state.store
+    out = ask(store, "who are you", user_key="visitor:x", actor="visitor")[
+        "text"
+    ].lower()
+    assert "manual" in out and "coffee" not in out and "demo" not in out, out
+
+
+def test_role_declines_off_topic() -> None:
+    role = (BOT / "role.md").read_text()
+    assert "## Stay in scope" in role
+    assert "writing emails" in role and "Do not offer a" in role
+    assert "/r/manuals-expert/" in role

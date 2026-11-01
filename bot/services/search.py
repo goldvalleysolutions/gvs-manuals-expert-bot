@@ -50,6 +50,13 @@ MESSAGES: dict[str, tuple[str, bool]] = {
     "size": ("{name}: that file is empty or over 10 MB.", True),
     "not_pdf": ("{name}: that file is not a PDF.", True),
     "unreadable": ("{name}: " + _search.UNREADABLE, True),
+    "no_text": (
+        (
+            "{name}: no searchable text found in this file (0 sections indexed), "
+            "so it was not added."
+        ),
+        True,
+    ),
     "too_big": ("{name}: " + _search.TOO_BIG, True),
     "exists": (
         (
@@ -206,6 +213,10 @@ async def upload(request: Request) -> Response:
         return _back("size", name)
     if name.endswith(".pdf") and not data.startswith(b"%PDF"):
         return _back("not_pdf", name)
+    if name.endswith(".md"):
+        text = data.decode("utf-8", errors="replace")
+        if not await run_in_threadpool(_search.index_chunks, text):
+            return _back("no_text", name)
     if name.endswith(".pdf"):
         # S3: parsing is CPU work; keep it off the event loop.
         problem = await run_in_threadpool(_search.check_pdf, data)

@@ -80,7 +80,12 @@ every result.
 
 PDFs must contain real text: a scanned (image-only) PDF or an unsupported text
 encoding is refused at upload with "No readable text found in this PDF (scanned or
-unsupported encoding)." PDFs that expand past 32 MB of data are refused too.
+unsupported encoding)." PDFs that expand past 32 MB of data are refused too. Text PDFs from LibreOffice,
+Word and similar tools (embedded subset fonts with a ToUnicode map) are read. Any
+file that would give nothing searchable (0 sections indexed) is refused at upload
+with "<file>: no searchable text found in this file (0 sections indexed), so it was
+not added." A file copied in with `docker cp` that indexes to nothing is skipped and
+logged as a warning (`docker logs manuals-expert`).
 
 Manual text is treated as **untrusted reference data**. Excerpts reach the model
 fenced as quoted reference text, never as instructions, and the role tells it never

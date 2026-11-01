@@ -1,0 +1,7 @@
+Game Ready GRPro 2.1 Cold Compression Unit - Clinic Quick Reference (sample)
+Section 4: Error E3 (low water)
+Fill the reservoir with cold water to the fill line, add ice, and reseat the connector hose until it clicks. Restart the unit.
+Section 5: Contraindications
+Do not use cold compression on patients with known Raynaud's phenomenon or over an open wound without clinician approval.
+Section 6: Daily cleaning
+Empty the reservoir at the end of each day and leave the lid open to dry.

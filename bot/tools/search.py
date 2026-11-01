@@ -12,6 +12,8 @@ coffee-shop manuals (``bot/demo/manuals/``) are no longer searched.
 
 from __future__ import annotations
 
+import bisect
+import logging
 import math
 import os
 import re
@@ -22,6 +24,8 @@ from typing import Any
 from core.sdk import tool
 from core.tools.registry import registered
 
+log = logging.getLogger("gvs.manuals")
+
 SLUG = "manuals-expert"
 DEFAULT_LIMIT = 5
 MAX_LIMIT = 20
@@ -31,7 +35,8 @@ MAX_INFLATED = (
     32 * 1024 * 1024
 )  # total decompressed PDF stream bytes per file (PDF bomb cap)
 MAX_TEXT = 2 * 1024 * 1024  # extracted text kept per manual
-MIN_TEXT = 20  # fewer readable characters than this: treat the PDF as unreadable
+MIN_TEXT = 20  # kept for compatibility
+MIN_WORDS = 3  # fewer searchable words than this: treat the PDF as unreadable
 MANUALS_URL = "/r/manuals-expert/"
 POINTER = f"Browse or add manuals: {MANUALS_URL}"
 POINTER_NOTE = f"End your reply with this exact line: {POINTER}"
@@ -243,28 +248,131 @@ class PdfTooLarge(ValueError):
 
 
 # One linear pass: every alternative is a plain character class, so no input can make
-# the tokenizer backtrack (no ``BT(.*?)ET`` / ``\[(.*?)\]`` scans).
-_TOK = re.compile(rb"\\[\s\S]|[()<>\[\]]|[A-Za-z*'\"]+|[^\\()<>\[\]A-Za-z*'\"]+")
+# the tokenizer backtrack (no ``BT(.*?)ET`` / ``\[(.*?)\]`` scans). Names (``/F1``) are
+# tokens so ``Tf`` knows the current font.
+_TOK = re.compile(
+    rb"\\[\s\S]|[()<>\[\]]|/[^\s/<>\[\]()%{}]*|[A-Za-z*'\"]+|[^\\()<>\[\]/A-Za-z*'\"]+"
+)
 MAX_STREAMS = 5000
+MAX_CMAP = 1024 * 1024  # bytes of one ToUnicode CMap we parse
+MAX_CMAP_CODES = 65536  # codes kept per CMap
+
+
+class CMap:
+    """A font's ToUnicode map: glyph code bytes -> Unicode text."""
+
+    def __init__(self, width: int, codes: dict[int, str]) -> None:
+        self.width = width
+        self.codes = codes
+
+    def decode(self, raw: bytes) -> str:
+        w = self.width
+        out = []
+        for i in range(0, len(raw) - w + 1, w):
+            code = int.from_bytes(raw[i : i + w], "big")
+            out.append(self.codes.get(code, ""))
+        return "".join(out)
+
+
+def _utf16(hexd: bytes) -> str:
+    try:
+        return bytes.fromhex(hexd.decode()).decode("utf-16-be", errors="replace")
+    except ValueError:
+        return ""
+
+
+def _blocks(text: bytes, begin: bytes, end: bytes) -> list[bytes]:
+    """Bodies between begin/end markers, found with bytes.find (linear)."""
+    out, pos = [], 0
+    while True:
+        i = text.find(begin, pos)
+        if i < 0:
+            return out
+        j = text.find(end, i)
+        if j < 0:
+            return out
+        out.append(text[i + len(begin) : j])
+        pos = j + len(end)
+
+
+def parse_cmap(text: bytes) -> CMap | None:
+    """bfchar / bfrange entries of a ToUnicode CMap (bounded regexes, capped size)."""
+    text = text[:MAX_CMAP]
+    widths = re.findall(
+        rb"<([0-9A-Fa-f]+)>\s*<[0-9A-Fa-f]+>", text.split(b"endcodespacerange")[0]
+    )
+    width = max(1, len(widths[0]) // 2) if widths else 1
+    codes: dict[int, str] = {}
+    for block in _blocks(text, b"beginbfchar", b"endbfchar"):
+        for src, dst in re.findall(
+            rb"<([0-9A-Fa-f]{1,8})>\s*<([0-9A-Fa-f]{0,256})>", block
+        ):
+            if len(codes) < MAX_CMAP_CODES:
+                codes[int(src, 16)] = _utf16(dst)
+    for block in _blocks(text, b"beginbfrange", b"endbfrange"):
+        for lo, hi, dst, arr in re.findall(
+            rb"<([0-9A-Fa-f]{1,8})>\s*<([0-9A-Fa-f]{1,8})>\s*(?:<([0-9A-Fa-f]{1,256})>|\[([^\]]{0,65536})\])",
+            block,
+        ):
+            lo_i, hi_i = int(lo, 16), min(int(hi, 16), int(lo, 16) + 65535)
+            if arr:
+                for k, d in enumerate(re.findall(rb"<([0-9A-Fa-f]{0,256})>", arr)):
+                    if lo_i + k > hi_i or len(codes) >= MAX_CMAP_CODES:
+                        break
+                    codes[lo_i + k] = _utf16(d)
+            else:
+                base = bytes.fromhex(dst.decode()) if len(dst) % 2 == 0 else b""
+                if len(base) < 2:
+                    continue
+                head, last = base[:-2], int.from_bytes(base[-2:], "big")
+                for k in range(hi_i - lo_i + 1):
+                    if len(codes) >= MAX_CMAP_CODES:
+                        break
+                    ch = head + ((last + k) & 0xFFFF).to_bytes(2, "big")
+                    codes[lo_i + k] = ch.decode("utf-16-be", errors="replace")
+    return CMap(width, codes) if codes else None
+
+
+def _hex_bytes(raw: bytes) -> bytes | None:
+    if re.search(rb"[^0-9A-Fa-f\s]", raw):
+        return None  # a <<dict>> or junk, not a hex string
+    hexd = re.sub(rb"\s", b"", raw)
+    if len(hexd) % 2:
+        hexd += b"0"
+    return bytes.fromhex(hexd.decode())
+
+
+def _plain(raw: bytes) -> str:
+    if raw.startswith(b"\xfe\xff"):
+        return raw[2:].decode("utf-16-be", errors="replace")
+    return raw.decode("latin-1")
 
 
 def _pdf_hex(raw: bytes) -> str:
-    hexd = re.sub(rb"[^0-9A-Fa-f]", b"", raw)
-    if len(hexd) % 2:
-        hexd += b"0"
-    data = bytes.fromhex(hexd.decode())
-    if data.startswith(b"\xfe\xff"):
-        return data[2:].decode("utf-16-be", errors="replace")
-    return data.decode("latin-1")
+    data = _hex_bytes(raw)
+    return _plain(data) if data is not None else ""
 
 
-def _pdf_strings(content: bytes, limit: int = MAX_TEXT) -> list[str]:
-    """Text of each BT..ET block, from (literal) and <hex> strings shown by Tj/TJ/'/"."""
+def _pdf_strings(
+    content: bytes, limit: int = MAX_TEXT, fonts: dict[bytes, CMap] | None = None
+) -> list[str]:
+    """Text of each BT..ET block, from (literal) and <hex> strings shown by Tj/TJ/'/".
+
+    ``fonts`` maps resource names (``/F1``) to ToUnicode CMaps; strings drawn in such a
+    font are decoded through it (subset TrueType / Identity-H fonts), else as Latin-1.
+    """
+    fonts = fonts or {}
     out: list[str] = []
     line: list[str] = []
     pending: list[str] = []
     in_bt = False
     used = 0
+    cmap: CMap | None = None
+    last_name = b""
+
+    def text_of(raw: bytes) -> str:
+        return cmap.decode(raw) if cmap is not None else _plain(raw)
+
     toks = (m.group(0) for m in _TOK.finditer(content))
     for tok in toks:
         if tok == b"(":
@@ -278,15 +386,20 @@ def _pdf_strings(content: bytes, limit: int = MAX_TEXT) -> list[str]:
                         break
                 buf += t
             if in_bt:
-                pending.append(_pdf_unescape(bytes(buf)))
+                pending.append(text_of(_pdf_unescape_bytes(bytes(buf))))
         elif tok == b"<":
             buf = bytearray()
             for t in toks:
                 if t in (b">", b"<"):
                     break
                 buf += t
-            if in_bt and buf:
-                pending.append(_pdf_hex(bytes(buf)))
+            raw = _hex_bytes(bytes(buf)) if in_bt and buf else None
+            if raw:
+                pending.append(text_of(raw))
+        elif tok.startswith(b"/"):
+            last_name = tok
+        elif tok == b"Tf":
+            cmap = fonts.get(last_name)
         elif not in_bt:
             in_bt = tok == b"BT"
             line, pending = [], []
@@ -311,16 +424,18 @@ def _pdf_strings(content: bytes, limit: int = MAX_TEXT) -> list[str]:
     return out
 
 
-def _pdf_unescape(raw: bytes) -> str:
-    maps = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"(": b"(", b")": b")", b"\\": b"\\"}
+_ESC = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"(": b"(", b")": b")", b"\\": b"\\"}
+
+
+def _pdf_unescape_bytes(raw: bytes) -> bytes:
     res = bytearray()
     i = 0
     while i < len(raw):
         ch = raw[i : i + 1]
         if ch == b"\\" and i + 1 < len(raw):
             nxt = raw[i + 1 : i + 2]
-            if nxt in maps:
-                res += maps[nxt]
+            if nxt in _ESC:
+                res += _ESC[nxt]
                 i += 2
                 continue
             octal = re.match(rb"[0-7]{1,3}", raw[i + 1 : i + 4])
@@ -332,11 +447,15 @@ def _pdf_unescape(raw: bytes) -> str:
             continue
         res += ch
         i += 1
-    return res.decode("latin-1")
+    return bytes(res)
+
+
+def _pdf_unescape(raw: bytes) -> str:
+    return _pdf_unescape_bytes(raw).decode("latin-1")
 
 
 def _streams(data: bytes):
-    """Raw stream bodies, found with str.find (linear), at most MAX_STREAMS."""
+    """(offset, raw body) of each stream, found with bytes.find (linear), <= MAX_STREAMS."""
     pos = 0
     for _ in range(MAX_STREAMS):
         i = data.find(b"stream", pos)
@@ -353,20 +472,48 @@ def _streams(data: bytes):
         end = data.find(b"endstream", start)
         if end < 0:
             return
-        yield data[start:end].rstrip(b"\r\n")
+        yield i, data[start:end].rstrip(b"\r\n")
         pos = end + 9
 
 
-def pdf_text(data: bytes) -> str:
-    """Best-effort text from a simple text PDF (Flate or plain streams, no OCR).
+_OBJ = re.compile(rb"(\d{1,10})\s+\d{1,5}\s+obj\b")
+_REF = rb"(\d{1,10})\s+\d{1,5}\s+R"
 
-    Inflation is capped at MAX_INFLATED bytes per file (raises PdfTooLarge), streams at
-    MAX_STREAMS and the extracted text at MAX_TEXT characters.
+
+def _font_names(data: bytes, objs: dict[int, bytes]) -> dict[bytes, int]:
+    """Resource name (``/F1``) -> font object number, from every ``/Font <<..>>`` dict."""
+    names: dict[bytes, int] = {}
+    bodies = [m.group(1) for m in re.finditer(rb"/Font\s*<<([^>]{0,8192})>>", data)]
+    for m in re.finditer(rb"/Font\s+" + _REF, data):
+        body = objs.get(int(m.group(1)), b"")
+        inner = re.search(rb"<<([^>]{0,8192})>>", body)
+        if inner:
+            bodies.append(inner.group(1))
+    for body in bodies:
+        for name, num in re.findall(rb"(/[^\s/<>\[\]()%{}]+)\s+" + _REF, body):
+            names.setdefault(name, int(num))
+    return names
+
+
+def pdf_text(data: bytes) -> str:
+    """Best-effort text from a text PDF (Flate or plain streams, no OCR).
+
+    Fonts with a ToUnicode CMap (LibreOffice/Word subset TrueType, Identity-H) are
+    decoded through it. Inflation is capped at MAX_INFLATED bytes per file (raises
+    PdfTooLarge), streams at MAX_STREAMS and the extracted text at MAX_TEXT characters.
     """
-    texts: list[str] = []
+    starts = [(m.start(), int(m.group(1))) for m in _OBJ.finditer(data)]
+    objs: dict[int, bytes] = {}
+    for k, (pos, num) in enumerate(starts):  # object dict text (stream data excluded)
+        end = starts[k + 1][0] if k + 1 < len(starts) else len(data)
+        body = data[pos:end]
+        cut = body.find(b"stream")
+        objs[num] = body[: cut if cut >= 0 else 4096][:4096]
+    offsets = [p for p, _ in starts]
     budget = MAX_INFLATED
-    left = MAX_TEXT
-    for raw in _streams(data):
+    contents: list[bytes] = []
+    cmaps: dict[int, CMap] = {}
+    for at, raw in _streams(data):
         try:
             inflater = zlib.decompressobj()
             out = inflater.decompress(raw, budget + 1)
@@ -376,7 +523,26 @@ def pdf_text(data: bytes) -> str:
             raw = out
         except zlib.error:
             pass
-        for t in _pdf_strings(raw, left):
+        if (
+            b"begincmap" in raw[:4096]
+            or b"beginbfchar" in raw
+            or b"beginbfrange" in raw
+        ):
+            k = bisect.bisect_right(offsets, at) - 1
+            parsed = parse_cmap(raw)
+            if k >= 0 and parsed:
+                cmaps[starts[k][1]] = parsed
+        else:
+            contents.append(raw)
+    fonts: dict[bytes, CMap] = {}
+    for name, font_num in _font_names(data, objs).items():
+        tu = re.search(rb"/ToUnicode\s+" + _REF, objs.get(font_num, b""))
+        if tu and int(tu.group(1)) in cmaps:
+            fonts[name] = cmaps[int(tu.group(1))]
+    texts: list[str] = []
+    left = MAX_TEXT
+    for raw in contents:
+        for t in _pdf_strings(raw, left, fonts):
             if t.strip():
                 texts.append(t)
                 left -= len(t) + 1
@@ -385,13 +551,44 @@ def pdf_text(data: bytes) -> str:
     return "\n".join(texts)[:MAX_TEXT]
 
 
+_PDF_HEADING = re.compile(
+    r"\s*((section|chapter|part)\s+\d+[A-Za-z]?[.:)]?\s+\S.{0,80}|\d{1,2}(\.\d{1,2}){0,2}\.?\s+[A-Z].{0,60})\s*$",
+    re.IGNORECASE,
+)
+
+
+def pdf_markdown(text: str) -> str:
+    """PDF text has no Markdown headings: make the first line the title and numbered
+    "Section 4: ..." / "2.1 Cleaning" lines section headings, so search can cite them."""
+    out: list[str] = []
+    titled = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not titled:
+            out.append("# " + stripped)
+            titled = True
+        elif len(stripped) <= 90 and _PDF_HEADING.fullmatch(stripped):
+            out.append("## " + stripped)
+        else:
+            out.append(stripped)
+    return "\n".join(out)
+
+
+def index_chunks(text: str, cleaned: bool = False) -> int:
+    """Searchable sections in manual text (0 = nothing would ever match)."""
+    text = text if cleaned else clean(text)
+    return sum(1 for h, b in sections_of(text) if terms(h + " " + b))
+
+
 def check_pdf(data: bytes) -> str:
     """Empty string when the PDF has readable text, else the message for the uploader."""
     try:
         text = pdf_text(data)
     except PdfTooLarge:
         return TOO_BIG
-    if len(re.sub(r"\s", "", text)) < MIN_TEXT:
+    if len(terms(text)) < MIN_WORDS or not index_chunks(pdf_markdown(text)):
         return UNREADABLE
     return ""
 
@@ -408,12 +605,16 @@ def read_manual(path: Path) -> str:
         return _CACHE[key]
     if path.suffix.lower() == ".pdf":
         try:
-            text = pdf_text(path.read_bytes())
+            text = pdf_markdown(pdf_text(path.read_bytes()))
         except PdfTooLarge:
             text = ""
     else:
         text = path.read_text(encoding="utf-8", errors="replace")[:MAX_TEXT]
     text = clean(text)
+    if not index_chunks(text, cleaned=True):
+        # A file dropped in with docker cp (or a PDF we cannot read) would otherwise
+        # vanish from search without a trace.
+        log.warning("manuals: %s has no searchable text; it is not indexed", path.name)
     for old in [k for k in _CACHE if k[0] == key[0]]:
         del _CACHE[old]
     _CACHE[key] = text
@@ -514,6 +715,9 @@ def search_corpus(
                     score += idf[t] * 0.5
             if best is None or score > best[0]:
                 best = (score, heading, body)
+        if best is None and secs and all(t in t_terms for t in q_terms):
+            # The question only names the manual ("Game Ready"): show its first section.
+            best = (sum(idf[t] for t in q_terms) * 0.5, secs[0][0], secs[0][1])
         if best:
             hits.append(
                 {
