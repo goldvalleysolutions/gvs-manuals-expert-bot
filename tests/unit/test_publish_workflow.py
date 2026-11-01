@@ -44,6 +44,7 @@ def test_no_latest_no_ghcr_no_variables() -> None:
         assert "latest" not in str((s.get("with") or {}).get("tags", ""))
     assert "ghcr" not in low and "publish_enabled" not in low and "vars." not in low
     assert DOC["permissions"] == {"contents": "read"}
+    assert DOC["jobs"]["publish"]["permissions"] == {"contents": "write"}
     assert "goldvalleysolutions/manuals-expert-bot" in TEXT
 
 
@@ -75,3 +76,14 @@ def test_version_comes_from_bot_yaml() -> None:
         (REPO / "bot" / "bot.yaml").read_text(),
         re.MULTILINE,
     )
+
+
+def test_github_release_only_on_publish_with_image_tags() -> None:
+    rel = next(s for s in STEPS if s.get("name") == "Create GitHub release")
+    assert rel["if"] == "steps.mode.outputs.push == 'true'"
+    run = rel["run"]
+    assert 'gh release create "v$VERSION"' in run
+    assert "$IMAGE:$VERSION" in run and "$IMAGE:$MINOR" in run
+    assert ":latest" not in run
+    mode = next(s for s in STEPS if s.get("id") == "mode")["run"]
+    assert 'gh release view "$TAG"' in mode

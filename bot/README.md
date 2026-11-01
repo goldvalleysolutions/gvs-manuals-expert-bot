@@ -19,8 +19,9 @@ is just an example.) **If port 8085 is taken** (`port is already allocated`), ru
 `docker rm manuals-expert` and repeat with another left side, e.g. `-p 8095:8080`, then
 use that port in the links below.
 
-> **Before the 0.1 release:** the image appears on Docker Hub when Manuals 0.1 is
-> released (after Bot Core 0.3). Until then `docker pull` fails; build both images
+> **Publishing:** the image is published to Docker Hub as
+> `goldvalleysolutions/manuals-expert-bot:0.1.0` (and `:0.1`) when the release is merged
+> to main. If `docker pull` fails because that has not happened yet, build both images
 > locally under the published names, then run the same `docker run` line:
 >
 > ```bash

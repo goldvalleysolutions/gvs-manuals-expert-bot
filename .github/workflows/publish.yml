@@ -1,7 +1,8 @@
 # Publish workflow. Merging test -> main IS the publish switch (only Mike merges to main).
 # On push to main it builds bot/Dockerfile (context: repo root) for linux/amd64 + linux/arm64
 # FROM goldvalleysolutions/core-bot:<core> and pushes goldvalleysolutions/manuals-expert-bot
-# as X.Y.Z and X.Y (version/core from bot/bot.yaml, never latest), then verifies both arches.
+# as X.Y.Z and X.Y (version/core from bot/bot.yaml, never latest), verifies both arches and
+# creates GitHub release vX.Y.Z (skipped, nothing pushed, if that release already exists).
 # Preflight fails the run, naming exactly which of DOCKERHUB_USERNAME / DOCKERHUB_TOKEN is missing.
 # workflow_dispatch is ALWAYS a dry run (build, never push; secrets not needed).
 # No repo variables, no PUBLISH_ENABLED, no GHCR. Same pattern as gvs-core-bot release.yml.
@@ -26,6 +27,8 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: write # only for `gh release create`
     env:
       IMAGE: goldvalleysolutions/manuals-expert-bot
     steps:
@@ -53,9 +56,15 @@ jobs:
           REF: ${{ github.ref }}
           HAS_USERNAME: ${{ secrets.DOCKERHUB_USERNAME != '' }}
           HAS_TOKEN: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.version.outputs.version }}
         run: |
           if [[ "$EVENT" != "push" || "$REF" != "refs/heads/main" ]]; then
             echo "::notice title=Dry run (manual run)::workflow_dispatch never publishes. The image is built for linux/amd64 + linux/arm64 but NOT pushed. Publishing happens only when Mike merges test into main."
+            echo "push=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice title=Already released::$TAG already exists. Bump version in bot/bot.yaml to publish; the image is built but nothing is pushed."
             echo "push=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           missing=()
@@ -127,6 +136,17 @@ jobs:
             grep -q "linux/amd64" <<<"$out" && grep -q "linux/arm64" <<<"$out"
           done
 
+      - name: Create GitHub release
+        if: steps.mode.outputs.push == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          MINOR: ${{ steps.version.outputs.minor }}
+        run: |
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "v$VERSION" --generate-notes \
+            --notes "Docker image (linux/amd64, linux/arm64): \`$IMAGE:$VERSION\` (also \`$IMAGE:$MINOR\`). Never \`latest\`."
+
       - name: Summary
         if: always()
         env:
@@ -139,6 +159,6 @@ jobs:
             if [[ "$PUSH" == "true" ]]; then
               echo "Pushed \`$IMAGE\` as \`$VERSION\` and \`$MINOR\` (linux/amd64, linux/arm64)."
             else
-              echo "**Not published:** dry run or failed preflight; nothing pushed (see notices)."
+              echo "**Not published:** dry run or failed preflight; nothing pushed, no release (see notices)."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
