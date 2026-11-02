@@ -1,0 +1,54 @@
+# Docker Hub description sync. Single owner of the goldvalleysolutions/manuals-expert-bot Docker Hub overview:
+# pushes README.md (full description) and a short description whenever README.md
+# changes on main, or on a manual run. Uses the existing DOCKERHUB_USERNAME /
+# DOCKERHUB_TOKEN secrets; hard-fails naming any missing secret.
+# The Docker Hub token needs Read, Write, Delete scope; a Read/Write token fails here.
+name: dockerhub-description
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "README.md"
+      - ".github/workflows/dockerhub-description.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  description:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check Docker Hub secrets
+        env:
+          HAS_USERNAME: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+          HAS_TOKEN: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        run: |
+          missing=()
+          [[ "$HAS_USERNAME" == "true" ]] || missing+=("DOCKERHUB_USERNAME")
+          [[ "$HAS_TOKEN" == "true" ]] || missing+=("DOCKERHUB_TOKEN")
+          if (( ${#missing[@]} )); then
+            for s in "${missing[@]}"; do
+              echo "::error title=Missing secret $s::Repository/org secret $s is not set; cannot update the Docker Hub description."
+            done
+            exit 1
+          fi
+
+      - name: Update Docker Hub description (README.md)
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: goldvalleysolutions/manuals-expert-bot
+          short-description: "Answers only from the equipment manuals you load, with citations. Built on Gold Valley Bot Core."
+          readme-filepath: ./README.md
