@@ -52,7 +52,7 @@ Full walkthrough: [bot/README.md](https://github.com/goldvalleysolutions/gvs-man
 | `bot/` | The bot pack copied onto Core: `Dockerfile`, `bot.yaml`, `role.md`, `skills/lookup/`, `tools/search.py`, `services/search.py` (Manuals page), `admin/`, `theme.yaml`, `demo/` (demo manuals) |
 | `scripts/` | `verify-local.sh` (all local checks) and `manuals-expert-steps.sh` (walkthrough against a built image) with helpers |
 | `tests/` | `unit/` (pytest), `e2e/` (Playwright, stub LLM), `fixtures/` |
-| `.github/workflows/` | `publish.yml`: main-only Docker Hub publish |
+| `.github/workflows/` | `publish.yml` (main-only Docker Hub publish), `dockerhub-description.yml` (Docker Hub overview from this README) |
 
 ## Build and test from source
 
@@ -82,7 +82,7 @@ Validate the manifest from a gvs-core-bot checkout: `make lint-bot BOT=<path to 
 
 PRs go to `test`; only Mike merges `test` into `main`. A merge to `main` publishes
 `goldvalleysolutions/manuals-expert-bot` as `X.Y.Z` and `X.Y` (never `latest`), creates
-GitHub release `vX.Y.Z`, and updates this Docker Hub description. The version is
+GitHub release `vX.Y.Z`. A README change merged to `main` updates this Docker Hub description (`dockerhub-description.yml`). The version is
 `version:` in `bot/bot.yaml`; the Core pin is `core:` there and `ARG CORE` in `bot/Dockerfile`.
 
 ## License

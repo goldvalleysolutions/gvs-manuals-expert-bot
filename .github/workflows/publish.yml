@@ -147,17 +147,6 @@ jobs:
             --title "v$VERSION" --generate-notes \
             --notes "Docker image (linux/amd64, linux/arm64): \`$IMAGE:$VERSION\` (also \`$IMAGE:$MINOR\`). Never \`latest\`."
 
-      - name: Update Docker Hub description (README.md)
-        # Needs a DOCKERHUB_TOKEN with Read, Write, Delete scope; a Read/Write token fails here.
-        if: steps.mode.outputs.push == 'true'
-        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: goldvalleysolutions/manuals-expert-bot
-          short-description: "Answers only from the equipment manuals you load, with citations. Built on Gold Valley Bot Core."
-          readme-filepath: ./README.md
-
       - name: Summary
         if: always()
         env:
