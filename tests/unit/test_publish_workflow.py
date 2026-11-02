@@ -96,9 +96,14 @@ def test_dockerhub_description_workflow_is_single_owner() -> None:
     on = wf[True]
     assert set(on) == {"push", "workflow_dispatch"}
     assert on["push"]["branches"] == ["main"]
-    assert set(on["push"]["paths"]) == {"README.md", ".github/workflows/dockerhub-description.yml"}
+    assert set(on["push"]["paths"]) == {
+        "README.md",
+        ".github/workflows/dockerhub-description.yml",
+    }
     assert wf["permissions"] == {"contents": "read"}
-    assert "DOCKERHUB_USERNAME" in text and "DOCKERHUB_TOKEN" in text and "exit 1" in text
+    assert (
+        "DOCKERHUB_USERNAME" in text and "DOCKERHUB_TOKEN" in text and "exit 1" in text
+    )
     assert "readme-filepath: ./README.md" in text
     uses = [s["uses"] for j in wf["jobs"].values() for s in j["steps"] if "uses" in s]
     assert any(u.startswith("peter-evans/dockerhub-description@") for u in uses)
