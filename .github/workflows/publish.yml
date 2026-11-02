@@ -1,0 +1,164 @@
+# Publish workflow. Merging test -> main IS the publish switch (only Mike merges to main).
+# On push to main it builds bot/Dockerfile (context: repo root) for linux/amd64 + linux/arm64
+# FROM goldvalleysolutions/core-bot:<core> and pushes goldvalleysolutions/manuals-expert-bot
+# as X.Y.Z and X.Y (version/core from bot/bot.yaml, never latest), verifies both arches and
+# creates GitHub release vX.Y.Z (skipped, nothing pushed, if that release already exists).
+# Preflight fails the run, naming exactly which of DOCKERHUB_USERNAME / DOCKERHUB_TOKEN is missing.
+# workflow_dispatch is ALWAYS a dry run (build, never push; secrets not needed).
+# No repo variables, no PUBLISH_ENABLED, no GHCR. Same pattern as gvs-core-bot release.yml.
+name: publish
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # only for `gh release create`
+    env:
+      IMAGE: goldvalleysolutions/manuals-expert-bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read version and core from bot/bot.yaml
+        id: version
+        run: |
+          v="$(sed -n 's/^version:[[:space:]]*//p' bot/bot.yaml | head -1 | tr -d '[:space:]"')"
+          core="$(sed -n 's/^core:[[:space:]]*//p' bot/bot.yaml | head -1 | tr -d '[:space:]"')"
+          if [[ ! "$v" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error title=Cannot read version::'version:' in bot/bot.yaml is '$v', expected semver X.Y.Z"; exit 1
+          fi
+          if [[ ! "$core" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Cannot read core::'core:' in bot/bot.yaml is '$core', expected X.Y"; exit 1
+          fi
+          { echo "version=$v"; echo "minor=${v%.*}"; echo "core=$core"; } >> "$GITHUB_OUTPUT"
+
+      - name: Preflight (publish or dry run)
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          HAS_USERNAME: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+          HAS_TOKEN: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.version.outputs.version }}
+        run: |
+          if [[ "$EVENT" != "push" || "$REF" != "refs/heads/main" ]]; then
+            echo "::notice title=Dry run (manual run)::workflow_dispatch never publishes. The image is built for linux/amd64 + linux/arm64 but NOT pushed. Publishing happens only when Mike merges test into main."
+            echo "push=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice title=Already released::$TAG already exists. Bump version in bot/bot.yaml to publish; the image is built but nothing is pushed."
+            echo "push=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          missing=()
+          [[ "$HAS_USERNAME" == "true" ]] || missing+=("DOCKERHUB_USERNAME")
+          [[ "$HAS_TOKEN" == "true" ]] || missing+=("DOCKERHUB_TOKEN")
+          if (( ${#missing[@]} )); then
+            for s in "${missing[@]}"; do
+              echo "::error title=Missing secret $s::Repository/org secret $s is not set; cannot publish to Docker Hub."
+            done
+            exit 1
+          fi
+          echo "push=true" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Docker Hub
+        if: steps.mode.outputs.push == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build manuals-expert-bot (dry run, never pushed)
+        if: steps.mode.outputs.push != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: bot/Dockerfile
+          push: false
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          outputs: type=cacheonly
+          build-args: |
+            CORE=${{ steps.version.outputs.core }}
+            VERSION=${{ steps.version.outputs.version }}
+            IMAGE_TAG=${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Push manuals-expert-bot (linux/amd64, linux/arm64)
+        if: steps.mode.outputs.push == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: bot/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE }}:${{ steps.version.outputs.minor }}
+          build-args: |
+            CORE=${{ steps.version.outputs.core }}
+            VERSION=${{ steps.version.outputs.version }}
+            IMAGE_TAG=${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify both arches on Docker Hub
+        if: steps.mode.outputs.push == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          MINOR: ${{ steps.version.outputs.minor }}
+        run: |
+          for tag in "$VERSION" "$MINOR"; do
+            out="$(docker buildx imagetools inspect "$IMAGE:$tag")"
+            echo "$out"
+            grep -q "linux/amd64" <<<"$out" && grep -q "linux/arm64" <<<"$out"
+          done
+
+      - name: Create GitHub release
+        if: steps.mode.outputs.push == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          MINOR: ${{ steps.version.outputs.minor }}
+        run: |
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "v$VERSION" --generate-notes \
+            --notes "Docker image (linux/amd64, linux/arm64): \`$IMAGE:$VERSION\` (also \`$IMAGE:$MINOR\`). Never \`latest\`."
+
+      - name: Summary
+        if: always()
+        env:
+          PUSH: ${{ steps.mode.outputs.push }}
+          VERSION: ${{ steps.version.outputs.version }}
+          MINOR: ${{ steps.version.outputs.minor }}
+        run: |
+          {
+            echo "### manuals-expert-bot $VERSION"
+            if [[ "$PUSH" == "true" ]]; then
+              echo "Pushed \`$IMAGE\` as \`$VERSION\` and \`$MINOR\` (linux/amd64, linux/arm64)."
+            else
+              echo "**Not published:** dry run or failed preflight; nothing pushed, no release (see notices)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

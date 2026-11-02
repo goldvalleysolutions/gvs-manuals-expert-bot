@@ -1,0 +1,6 @@
+# Settings pointer to the Manuals page. Core 0.3 has no nav/link hook for bot pages,
+# so this panel only shows a title (no fields); Core follow-up: bot nav links.
+name: manuals
+title: "Manuals: browse or add a manual at /r/manuals-expert/ (Add a manual is at the bottom)"
+level: bot_admin
+fields: []
