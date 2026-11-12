@@ -1,5 +1,12 @@
 # AGENTS.md
 
+## Software factory
+
+Do not copy factory process into this repo.
+At task start, pin goldvalleysolutions/gvs-factory `main`
+(https://github.com/goldvalleysolutions/gvs-factory/blob/main/docs/adopt.md).
+If factory source is missing or unreadable, FAIL. Do not skip factory gates.
+
 ## Bot architecture rules (review gate)
 
 Source: dev-team standard bot-architecture.md (Mike, Nov 1 2026).
