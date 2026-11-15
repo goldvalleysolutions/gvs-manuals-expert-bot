@@ -87,4 +87,4 @@ GitHub release `vX.Y.Z`. A README change merged to `main` updates this Docker Hu
 
 ## License
 
-Apache License 2.0 (declared in the image labels). Core: [gvs-core-bot LICENSE](https://github.com/goldvalleysolutions/gvs-core-bot/blob/main/LICENSE).
+Apache License 2.0 (declared in the image labels). See [LICENSE](LICENSE) and [NOTICE](NOTICE).
